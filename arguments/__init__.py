@@ -47,13 +47,20 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
+        self.feature_dim = 32
+        self.init_from_3dgs_pcd = False
         self._source_path = ""
         self._model_path = ""
+        self._feature_model_path = ""
         self._images = "images"
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+
+        self.need_features = False
+        self.need_masks = False
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -86,27 +93,48 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
-        self.random_background = False
+        self.point_dropout = 0.1
+
+        # Segmentation parameters
+        self.mask_lr = 1.0
+        self.optimization_times = 2
+        self.IoU_thresh = 0.5
+        self.IoA_thresh = 0.8
+        self.lamb = 0.3
         super().__init__(parser, "Optimization Parameters")
 
-def get_combined_args(parser : ArgumentParser):
+def get_combined_args(parser : ArgumentParser, target_cfg_file = None):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
+    
+    if target_cfg_file is None:
+        if args_cmdline.target == 'seg':
+            target_cfg_file = "seg_cfg_args"
+        elif args_cmdline.target == 'scene' or args_cmdline.target == 'xyz':
+            target_cfg_file = "cfg_args"
+        elif args_cmdline.target == 'feature' or args_cmdline.target == 'coarse_seg_everything' or args_cmdline.target == 'contrastive_feature' :
+            target_cfg_file = "feature_cfg_args"
 
     try:
-        cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
+        cfgfilepath = os.path.join(args_cmdline.model_path, target_cfg_file)
         print("Looking for config file in", cfgfilepath)
         with open(cfgfilepath) as cfg_file:
             print("Config file found: {}".format(cfgfilepath))
             cfgfile_string = cfg_file.read()
     except TypeError:
-        print("Config file not found at")
+        print("Config file found: {}".format(cfgfilepath))
         pass
     args_cfgfile = eval(cfgfile_string)
+
+    # for k in args_cfgfile.__dict__.keys():
+        # print(k, args_cfgfile.__dict__[k], "?")
 
     merged_dict = vars(args_cfgfile).copy()
     for k,v in vars(args_cmdline).items():
         if v != None:
             merged_dict[k] = v
+
+    # for k in merged_dict.keys():
+        # print(k, merged_dict[k])
     return Namespace(**merged_dict)

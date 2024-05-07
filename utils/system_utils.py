@@ -22,7 +22,20 @@ def mkdir_p(folder_path):
             pass
         else:
             raise
-
-def searchForMaxIteration(folder):
-    saved_iters = [int(fname.split("_")[-1]) for fname in os.listdir(folder)]
-    return max(saved_iters)
+def searchForMaxIteration(folder, target = "scene"):
+    fnames = os.listdir(folder)
+    saved_iters = []
+    for fname in fnames:
+        cur_dir = os.path.join(folder, fname)
+        plys = os.listdir(cur_dir)
+        has_target_ply = False
+        for p in plys:
+            if target in p:
+                has_target_ply = True
+                break
+        if has_target_ply:
+            saved_iters.append(int(fname.split("_")[-1]))
+    try:
+        return max(saved_iters)
+    except:
+        return None
