@@ -1,9 +1,9 @@
-[submodule "third_party/kmeans_pytorch"]
-	path = third_party/kmeans_pytorch
-	url = git@github.com:subhadarship/kmeans_pytorch.git
-[submodule "submodule/kmeans_pytorch"]
-	path = submodule/kmeans_pytorch
-	url = git@github.com:subhadarship/kmeans_pytorch.git
 [submodule "submodules/kmeans_pytorch"]
 	path = submodules/kmeans_pytorch
 	url = git@github.com:subhadarship/kmeans_pytorch.git
+[submodule "submodules/diff-gaussian-rasterization"]
+	path = submodules/diff-gaussian-rasterization
+	url = git@github.com:graphdeco-inria/diff-gaussian-rasterization.git
+[submodule "submodules/simple-knn"]
+	path = submodules/simple-knn
+	url = https://gitlab.inria.fr/bkerbl/simple-knn
