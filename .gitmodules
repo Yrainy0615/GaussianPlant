@@ -6,10 +6,7 @@
 	url = git@github.com:graphdeco-inria/diff-gaussian-rasterization.git
 [submodule "submodules/simple-knn"]
 	path = submodules/simple-knn
-	url = https://gitlab.inria.fr/bkerbl/simple-knn
-[submodule "submodules/diff-gaussian-tasterization"]
-	path = submodules/diff-gaussian-tasterization
-	url = git@github.com:graphdeco-inria/diff-gaussian-rasterization.git
+	url = https://gitlab.inria.fr/bkerbl/simple-knn.git	
 
 [submodule "submodules/segment_anything"]
 	path = submodules/segment_anything

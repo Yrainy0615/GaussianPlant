@@ -19,7 +19,7 @@ import uuid
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
-import sys
+
 import numpy as np
 from matplotlib import pyplot as plt
 from segment_anything import (SamAutomaticMaskGenerator, SamPredictor,
@@ -73,7 +73,7 @@ def training(dataset, opt, pipe, iteration):
 
     gaussians = GaussianModel(dataset.sh_degree)
 
-    feature_gaussians = FeatureGaussianModel(32)
+    feature_gaussians = FeatureGaussianModel(dataset.feature_dim)
     sample_rate = 1.0
     scene = Scene(dataset, gaussians, feature_gaussians, load_iteration=iteration, shuffle=False, target='contrastive_feature', mode='train', sample_rate=sample_rate)
 
@@ -86,7 +86,7 @@ def training(dataset, opt, pipe, iteration):
         torch.nn.Linear(64, 64, bias=True),
         torch.nn.LayerNorm(64),
         torch.nn.LeakyReLU(),
-        torch.nn.Linear(64, 32, bias=True)
+        torch.nn.Linear(64, dataset.feature_dim, bias=True)
     )
 
     sam_proj = sam_proj.cuda()
@@ -97,7 +97,7 @@ def training(dataset, opt, pipe, iteration):
     del gaussians
     torch.cuda.empty_cache()
 
-    background = torch.ones([32], dtype=torch.float32, device="cuda") if dataset.white_background else torch.zeros([32], dtype=torch.float32, device="cuda")
+    background = torch.ones([dataset.feature_dim], dtype=torch.float32, device="cuda") if dataset.white_background else torch.zeros([dataset.feature_dim], dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -192,8 +192,6 @@ if __name__ == "__main__":
     lp = ModelParams(parser, sentinel=True)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    if len(sys.argv) == 1:
-        sys.argv.extend(['-m', 'output/plant2'])
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")

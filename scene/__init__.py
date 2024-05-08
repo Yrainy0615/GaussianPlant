@@ -134,13 +134,13 @@ class Scene:
                 self.gaussians.load_ply(os.path.join(self.model_path,
                                                         "point_cloud",
                                                         "iteration_" + str(self.loaded_iter),
-                                                        "point_cloud.ply"))
+                                                        "scene_point_cloud.ply"))
             else:
                 if target == 'coarse_seg_everything':
                     self.gaussians.load_ply(os.path.join(self.model_path,
                                                             "point_cloud",
                                                             "iteration_" + str(self.loaded_iter),
-                                                            "point_cloud.ply"))
+                                                            "scene_point_cloud.ply"))
                 else:
                     self.gaussians.load_ply(os.path.join(self.model_path,
                                                             "point_cloud",
@@ -161,7 +161,7 @@ class Scene:
                     self.feature_gaussians.load_ply_from_3dgs(os.path.join(self.model_path,
                                                             "point_cloud",
                                                             "iteration_" + str(self.loaded_iter),
-                                                            "point_cloud.ply"))
+                                                            "scene_point_cloud.ply"))
                 elif mode == 'eval':
                     self.feature_gaussians.load_ply(os.path.join(self.model_path,
                                                         "point_cloud",
@@ -172,7 +172,7 @@ class Scene:
                     self.feature_gaussians.load_ply_from_3dgs(os.path.join(self.model_path,
                                                             "point_cloud",
                                                             "iteration_" + str(self.loaded_iter),
-                                                            "point_cloud.ply"))
+                                                            "scene_point_cloud.ply"))
                 elif mode == 'eval':
                     self.feature_gaussians.load_ply(os.path.join(self.model_path,
                                                         "point_cloud",
@@ -188,7 +188,7 @@ class Scene:
                             self.model_path, 
                             "point_cloud",
                             "iteration_" + str(searchForMaxIteration(os.path.join(self.model_path, "point_cloud"), target="scene") if (self.loaded_iter is None or self.loaded_iter == -1) else self.loaded_iter), 
-                            "point_cloud.ply"
+                            "scene_point_cloud.ply"
                         ), 
                         only_xyz=True
                     ), 
@@ -199,7 +199,7 @@ class Scene:
                     self.feature_gaussians.load_ply_from_3dgs(os.path.join(self.model_path,
                                                             "point_cloud",
                                                             "iteration_" + str(self.loaded_iter),
-                                                            "point_cloud.ply"))
+                                                            "scene_point_cloud.ply"))
                 elif mode == 'eval':
                     self.feature_gaussians.load_ply(os.path.join(self.model_path,
                                                         "point_cloud",
