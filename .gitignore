@@ -4,3 +4,4 @@ SIBR_viewers/
 *.so
 build/
 dist/
+*.pyc
