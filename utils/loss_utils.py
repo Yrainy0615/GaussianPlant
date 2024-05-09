@@ -8,11 +8,13 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+from utils.general_utils import reconstruct_covariance
+from scipy.spatial import cKDTree
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -62,3 +64,44 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
+
+def local_normal_consistency_loss(gaussians, k=10):
+    points = gaussians.get_xyz
+    covariances = gaussians.get_covariance()
+    # convert covariance matrix to 3*3
+    cov3d = reconstruct_covariance(covariances)
+    # calculate eigenvalues and eigenvectors of covariance matrices
+    eigenvalue, eigenvector = torch.linalg.eigh(cov3d)
+    pricipals = eigenvector[:, :, 2]
+    normals = eigenvector[:, :, 0]
+
+    
+    def find_nearest_neighbors(points, data_points, n_neighbors):
+        data_points = data_points.detach().cpu().numpy()
+        points = points.detach().cpu().numpy()
+        tree = cKDTree(data_points)
+        distances, indices = tree.query(points, n_neighbors)
+        return distances, indices
+    def find_nearest_neighbors_torch(points, data_points, n_neighbors):
+        dist_matrix = torch.cdist(points, data_points)
+        # batch 
+        batche_size = 1000
+        indices = torch.zeros((dist_matrix.shape[0], n_neighbors), dtype=torch.long, device=dist_matrix.device)
+        for i in range(0, dist_matrix.shape[0], batche_size):
+            end = min(i + batche_size, dist_matrix.shape[0])
+            batch_distance = dist_matrix[i:end]
+            distances_batch, indices_batch = torch.topk(batch_distance, n_neighbors, largest=False)
+            indices[i:end] = indices_batch
+        return indices
+    indices = find_nearest_neighbors_torch(points, points, n_neighbors=k)
+
+    # normal consistency loss
+    query_normals = normals[indices[:, 0]]
+    neighbor_normals = normals[indices[:, 1:].reshape(-1)].view(indices.shape[0], indices.shape[1] - 1, 3)
+    dot_products = (query_normals.unsqueeze(1) * neighbor_normals).sum(dim=2)
+    norm_query_normals = query_normals.norm(p=2, dim=1, keepdim=True)
+    norm_neighbor_normals = neighbor_normals.norm(p=2, dim=2)
+    cos_angles = dot_products / (norm_query_normals * norm_neighbor_normals + 1e-5)
+    normal_consistency_scores = cos_angles.abs().mean(dim=1)
+    loss = l2_loss(normal_consistency_scores, torch.ones_like(normal_consistency_scores)) 
+    return loss

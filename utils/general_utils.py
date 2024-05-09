@@ -72,6 +72,30 @@ def strip_lowerdiag(L):
     uncertainty[:, 5] = L[:, 2, 2]
     return uncertainty
 
+def reconstruct_covariance(uncertainty):
+    """
+    Reconstruct a batch of 3x3 covariance matrices from their stripped elements.
+    Assumes uncertainty is [N, 6] where each row is [sigma_11, sigma_12, sigma_13, sigma_22, sigma_23, sigma_33].
+    """
+    # Initialize an empty tensor for the full covariance matrices
+    N = uncertainty.shape[0]
+    full_matrices = torch.zeros((N, 3, 3), dtype=torch.float, device=uncertainty.device)
+
+    # Fill the diagonal elements
+    full_matrices[:, 0, 0] = uncertainty[:, 0]
+    full_matrices[:, 1, 1] = uncertainty[:, 3]
+    full_matrices[:, 2, 2] = uncertainty[:, 5]
+
+    # Fill the off-diagonal elements
+    full_matrices[:, 0, 1] = uncertainty[:, 1]
+    full_matrices[:, 1, 0] = uncertainty[:, 1]
+    full_matrices[:, 0, 2] = uncertainty[:, 2]
+    full_matrices[:, 2, 0] = uncertainty[:, 2]
+    full_matrices[:, 1, 2] = uncertainty[:, 4]
+    full_matrices[:, 2, 1] = uncertainty[:, 4]
+
+    return full_matrices
+
 def strip_symmetric(sym):
     return strip_lowerdiag(sym)
 
