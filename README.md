@@ -3,7 +3,6 @@
   <h1 align="center">GaussianPlant</h1>
     <p align="center">
       <a href="https://github.com/Yrainy0615">Yang Yang</a><sup>+</sup>
-      ·
     </p>
     <h3 align="center"> <a href="https://arxiv.org/pdf/2404.10484.pdf">arXiv</a> | <a href="https://ty424.github.io/AbsGS.github.io/">Project Page</a> | <a href="https://github.com/Yrainy0615/GaussianPlant">Code</a> </h3>
     <div align="center"></div>
