@@ -2,8 +2,6 @@
 - <p align="center">
   <h1 align="center">GaussianPlant</h1>
     <p align="center">
-        <a href="https://github.com/TY424">Zongxin Ye</a><sup>+</sup>
-      ·
       <a href="https://github.com/Yrainy0615">Yang Yang</a><sup>+</sup>
       ·
     </p>
