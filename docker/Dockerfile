@@ -8,7 +8,7 @@ RUN echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 # Install base utilities
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-    && apt-get install -y build-essential wget ninja-build unzip libgl-dev ffmpeg cmake\
+    && apt-get install -y build-essential wget ninja-build unzip libgl-dev ffmpeg cmake g++  libglfw3-dev libgles2-mesa-dev  \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
