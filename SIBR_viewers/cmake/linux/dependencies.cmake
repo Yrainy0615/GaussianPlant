@@ -114,7 +114,7 @@ include_directories(${FFMPEG_INCLUDE_DIR})
 ## COMMENT OUT ALL FFMPEG FOR CLUSTER
 
 ###################
-## Find embree3
+## Find embree
 ###################
 sibr_addlibrary(
     NAME embree3
@@ -124,7 +124,7 @@ sibr_addlibrary(
 
 # CLUSTER
 #find_package(embree 3.0 REQUIRED PATHS "/data/graphdeco/share/embree/usr/local/lib64/cmake/" )
-find_package(embree 3.0 )
+find_package(embree 4.0 )
 
 ###################
 ## Find eigen3
