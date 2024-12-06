@@ -1,6 +1,6 @@
 username=yyang
 project_name=gaussianplant
-container_name=gaussian_surfels
+container_name=SuGaR
 
 docker run --gpus all -itd \
     -u $(id -u $username):$(id -g $username) \
