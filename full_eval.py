@@ -12,10 +12,15 @@
 import os
 from argparse import ArgumentParser
 
-mipnerf360_outdoor_scenes = ["bicycle", "flowers", "garden", "stump", "treehill"]
-mipnerf360_indoor_scenes = ["room", "counter", "kitchen", "bonsai"]
-tanks_and_temples_scenes = ["truck", "train"]
-deep_blending_scenes = ["drjohnson", "playroom"]
+# mipnerf360_outdoor_scenes = ["bicycle", "flowers", "garden", "stump", "treehill"]
+# mipnerf360_indoor_scenes = ["room", "counter", "kitchen", "bonsai"]
+# tanks_and_temples_scenes = ["truck", "train"]
+# deep_blending_scenes = ["drjohnson", "playroom"]
+
+mipnerf360_outdoor_scenes = ["bicycle"]
+mipnerf360_indoor_scenes = []
+tanks_and_temples_scenes = []
+deep_blending_scenes = []
 
 parser = ArgumentParser(description="Full evaluation script parameters")
 parser.add_argument("--skip_training", action="store_true")
@@ -40,6 +45,7 @@ if not args.skip_training:
     common_args = " --quiet --eval --test_iterations -1 "
     for scene in mipnerf360_outdoor_scenes:
         source = args.mipnerf360 + "/" + scene
+        print("python train.py -s " + source + " -i images_4 -m " + args.output_path + "/" + scene + common_args)
         os.system("python train.py -s " + source + " -i images_4 -m " + args.output_path + "/" + scene + common_args)
     for scene in mipnerf360_indoor_scenes:
         source = args.mipnerf360 + "/" + scene

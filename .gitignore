@@ -1,7 +1,8 @@
-output/
-SIBR_viewers/
-*.o
-*.so
-build/
-dist/
-*.pyc
+# 默认忽略的文件
+.idea
+/shelf/
+/workspace.xml
+/output
+/data
+.pyc
+/submodules
