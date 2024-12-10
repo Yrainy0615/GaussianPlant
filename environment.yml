@@ -1,10 +1,10 @@
-name: gaussian_splatting
+name: gs_base
 channels:
   - pytorch
   - conda-forge
   - defaults
 dependencies:
-  - cudatoolkit=11.6
+  - cudatoolkit=11.7
   - plyfile
   - python=3.7.13
   - pip=22.3.1
@@ -13,5 +13,8 @@ dependencies:
   - torchvision=0.13.1
   - tqdm
   - pip:
-    - submodules/diff-gaussian-rasterization
-    - submodules/simple-knn
+    # - submodules/diff-gaussian-rasterization
+    # - submodules/simple-knn
+    # - submodules/fused-ssim
+    - opencv-python
+    - joblib
