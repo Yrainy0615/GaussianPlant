@@ -21,7 +21,10 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-
+from scipy.spatial.transform import Rotation as R
+from sklearn.cluster import KMeans
+from pytorch3d.transforms import quaternion_to_matrix, quaternion_invert, quaternion_apply
+from pytorch3d.ops import knn_points, estimate_pointcloud_normals
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
@@ -63,8 +66,10 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.knn_to_track = 16
         self.setup_functions()
-
+        self.knn_dists = None
+        self.knn_idx = None
     def capture(self):
         return (
             self.active_sh_degree,
@@ -471,3 +476,395 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def build_stprs_from_gs(self, num_clusters):
+        """
+        Build structural primitives (StPrs) from optimized Gaussians by clustering them.
+        :param num_clusters: Number of clusters for grouping Gaussians into structural primitives.
+        """
+        # Extract Gaussian properties
+        xyz = self._xyz.detach().cpu().numpy()  # Gaussian positions
+        scaling = self.get_scaling.detach().cpu().numpy()  # Gaussian scales
+        rotation = self.get_rotation.detach().cpu().numpy()  # Gaussian rotations
+        covariance = self.get_covariance().detach().cpu().numpy()  # Gaussian covariance matrices
+
+        # Flatten covariance matrices for clustering
+        covariances_flat = covariance.reshape(covariance.shape[0], -1)
+        feature_vectors = np.hstack((xyz, covariances_flat))  # Include covariance in clustering
+
+        # Apply clustering to Gaussian positions and covariance
+        kmeans = KMeans(n_clusters=num_clusters, random_state=0).fit(feature_vectors)
+        cluster_labels = kmeans.labels_
+        cluster_centers = kmeans.cluster_centers_[:, :3]  # Extract only position components
+
+        # Initialize lists for StPr parameters
+        stpr_positions = []
+        stpr_scales = []
+        stpr_rotations = []
+
+        for cluster_id in range(num_clusters):
+            cluster_points = xyz[cluster_labels == cluster_id]
+            cluster_scales = scaling[cluster_labels == cluster_id]
+            cluster_rotations = rotation[cluster_labels == cluster_id]
+
+            if len(cluster_points) > 1:
+                # Compute PCA for scaling & rotation estimation
+                mean = np.mean(cluster_points, axis=0)
+                centered = cluster_points - mean
+                cov = np.dot(centered.T, centered) / len(cluster_points)
+                eigvals, eigvecs = np.linalg.eigh(cov)
+
+                # Use PCA eigenvectors as orientation
+                stpr_rot = R.from_matrix(eigvecs).as_quat()
+                stpr_scale = np.sqrt(eigvals).clip(min=0.01)  # Ensure valid scale values
+            else:
+                # If only one point in cluster, use its existing rotation and scale
+                mean = cluster_points[0]
+                stpr_rot = cluster_rotations[0]
+                stpr_scale = cluster_scales[0]
+
+            stpr_positions.append(mean)
+            stpr_scales.append(stpr_scale)
+            stpr_rotations.append(stpr_rot)
+
+        # Convert lists to tensors
+        stpr_positions = torch.tensor(np.array(stpr_positions), dtype=torch.float, device="cuda")
+        stpr_scales = torch.tensor(np.array(stpr_scales), dtype=torch.float, device="cuda")
+        stpr_rotations = torch.tensor(np.array(stpr_rotations), dtype=torch.float, device="cuda")
+
+        # Initialize a new GaussianModel for StPrs and return it
+        self.structure_gs = GaussianModel(sh_degree=self.max_sh_degree, divide_ratio=self.divide_ratio)
+        self.structure_gs._xyz = nn.Parameter(stpr_positions.requires_grad_(True))
+        self.structure_gs._scaling = nn.Parameter(stpr_scales.requires_grad_(True))
+        self.structure_gs._rotation = nn.Parameter(stpr_rotations.requires_grad_(True))
+        self.structure_gs._features_dc = nn.Parameter(torch.zeros((stpr_positions.shape[0], 1, 3), device="cuda").requires_grad_(True))
+        self.structure_gs._features_rest = nn.Parameter(torch.zeros((stpr_positions.shape[0], 15, 3), device="cuda").requires_grad_(True))
+        self.structure_gs._opacity = nn.Parameter(torch.ones((stpr_positions.shape[0], 1), device="cuda").requires_grad_(True))
+        self.structure_gs.max_radii2D = torch.zeros((stpr_positions.shape[0]), device="cuda")
+        
+
+        print(f"Initialized {num_clusters} Structural Primitives (StPrs) from Gaussian clustering.")
+        return self.structure_gs
+
+    
+    def build_appgs_from_stprs(self, samples_per_stgs=10):
+        if self.structure_gs is not None:
+            points_st = self.structure_gs._xyz.detach()
+            quaternions_st = self.structure_gs._rotation.detach()
+            scaling_st = self.structure_gs._scaling.detach()
+            gaussian_samples = points_st.unsqueeze(1) + quaternion_apply(
+                quaternions_st.unsqueeze(1), 
+                scaling_st.unsqueeze(1) * torch.randn(
+                    points_st.shape[0], samples_per_stgs, 3, device="cuda"))
+        
+            # init gaussian parameters 
+            new_means = gaussian_samples.reshape(-1,3)
+            scales = scaling_st.unsqueeze(1).repeat(1, samples_per_stgs, 1) / samples_per_stgs
+            scales[:, :,-1] = 1e-6
+            scales= scales.reshape(-1,3)
+            rots = quaternions_st.unsqueeze(1).repeat(1, samples_per_stgs, 1)
+            rots = rots.reshape(-1,4)
+            # init features
+            features_dc = self.structure_gs._features_dc.detach().unsqueeze(1).repeat(1, samples_per_stgs, 1, 1).reshape(-1,1,3)
+            # assign features to each gaussian from the same structure
+            features_rest = self.structure_gs._features_rest.detach().unsqueeze(1).repeat(1, samples_per_stgs, 1, 1).reshape(-1,15,3)
+            # init opacity
+            new_opacities = self.structure_gs._opacity.unsqueeze(1).repeat(1, samples_per_stgs, 1).reshape(-1,1)    
+            # Set Gaussian parameters
+            self.appgs = GaussianModel(sh_degree=self.max_sh_degree, divide_ratio=self.divide_ratio)
+            self.appgs._xyz = nn.Parameter(new_means.requires_grad_(True))
+            self.appgs._scaling = nn.Parameter(scales.requires_grad_(True))
+            self.appgs._rotation = nn.Parameter(rots.requires_grad_(True))
+            self.appgs._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+            self.appgs._features_rest = nn.Parameter(features_rest.requires_grad_(True))
+            self.appgs._opacity = nn.Parameter(new_opacities.requires_grad_(True))
+            self.appgs.max_radii2D = torch.zeros((new_means.shape[0]), device="cuda")
+            return self.appgs
+
+
+
+        else: 
+                print("No structure to bind to")
+
+    def compute_gaussian_overlap_with_neighbors(
+        self, 
+        neighbor_idx,
+        use_gaussian_center_only=True,
+        n_samples_to_compute_overlap=32,
+        weight_by_normal_angle=False,
+        propagate_gradient_to_points_only=False,
+        ):
+        
+        # This is used to skip the first neighbor, which is the point itself
+        neighbor_start_idx = 1
+        
+        # Get sampled points
+        point_idx = neighbor_idx[:, 0]  # (n_points, )
+        n_points = len(point_idx)
+        
+        # Decide whether we want to propagate the gradient to the points only, or to the points and the covariance parameters
+        if propagate_gradient_to_points_only:
+            scaling = self.scaling.detach()
+            quaternions = self.quaternions.detach()
+        else:
+            scaling = self.scaling
+            quaternions = self.quaternions
+        
+        # Samples points in the corresponding gaussians
+        if use_gaussian_center_only:
+            n_samples_to_compute_overlap = 1
+            gaussian_samples = self.points[point_idx].unsqueeze(1) + 0.  # (n_points, n_samples_to_compute_overlap, 3)
+        else:
+            gaussian_samples = self.points[point_idx].unsqueeze(1) + quaternion_apply(
+                quaternions[point_idx].unsqueeze(1), 
+                scaling[point_idx].unsqueeze(1) * torch.randn(
+                    n_points, n_samples_to_compute_overlap, 3, 
+                    device=self.device)
+                )  # (n_points, n_samples_to_compute_overlap, 3)
+        
+        # >>> We will now compute the gaussian weight of all samples, for each neighbor gaussian.
+        # We start by computing the shift between the samples and the neighbor gaussian centers.
+        neighbor_center_to_samples = gaussian_samples.unsqueeze(1) - self.points[neighbor_idx[:, neighbor_start_idx:]].unsqueeze(2)  # (n_points, n_neighbors-1, n_samples_to_compute_overlap, 3)
+        
+        # We compute the inverse of the scaling of the neighbor gaussians. 
+        # For 2D gaussians, we implictly project the samples on the plane of each gaussian; 
+        # We do so by setting the inverse of the scaling of the gaussian to 0 in the direction of the gaussian normal (i.e. 0-axis).
+        inverse_scales = 1. / scaling[neighbor_idx[:, neighbor_start_idx:]].unsqueeze(2)  # (n_points, n_neighbors-1, 1, 3)
+        
+        # We compute the "gaussian distance" of all samples to the neighbor gaussians, i.e. the norm of the unrotated shift,
+        # weighted by the inverse of the scaling of the neighbor gaussians.
+        gaussian_distances = inverse_scales * quaternion_apply(
+            quaternion_invert(quaternions[neighbor_idx[:, neighbor_start_idx:]]).unsqueeze(2), 
+            neighbor_center_to_samples
+            )  # (n_points, n_neighbors-1, n_samples_to_compute_overlap, 3)
+        
+        # Now we can compute the gaussian weights of all samples, for each neighbor gaussian.
+        # We then sum them to get the gaussian overlap of each neighbor gaussian.
+        gaussian_weights = torch.exp(-1./2. * (gaussian_distances ** 2).sum(dim=-1))  # (n_points, n_neighbors-1, n_samples_to_compute_overlap)
+        gaussian_overlaps = gaussian_weights.mean(dim=-1)  # (n_points, n_neighbors-1)
+        
+        # If needed, we weight the gaussian overlaps by the angle between the normal of the neighbor gaussian and the normal of the point gaussian
+        if weight_by_normal_angle:
+            normals = self.get_normals()[neighbor_idx]  # (n_points, n_neighbors, 3)
+            weights = (normals[:, 1:] * normals[:, 0:1]).sum(dim=-1).abs()  # (n_points, n_neighbors-1)
+            gaussian_overlaps = gaussian_overlaps * weights
+            
+        return gaussian_overlaps
+    
+    def compute_gaussian_alignment_with_neighbors(
+        self,
+        neighbor_idx,
+        weight_by_normal_angle=False,
+        propagate_gradient_to_points_only=False,
+        std_factor = 1.,
+        ):
+        
+        # This is used to skip the first neighbor, which is the point itself
+        neighbor_start_idx = 1
+        
+        # Get sampled points
+        point_idx = neighbor_idx[:, 0]  # (n_points, )
+        n_points = len(point_idx)
+        
+        # Decide whether we want to propagate the gradient to the points only, or to the points and the covariance parameters
+        if propagate_gradient_to_points_only:
+            scaling = self.scaling.detach()
+            quaternions = self.quaternions.detach()
+        else:
+            scaling = self.scaling
+            quaternions = self.quaternions
+        
+        # We compute scaling, inverse quaternions and centers for all gaussians and their neighbors
+        all_scaling = scaling[neighbor_idx]
+        all_invert_quaternions = quaternion_invert(quaternions)[neighbor_idx]
+        all_centers = self.points[neighbor_idx]
+        
+        # We compute direction vectors between the gaussians and their neighbors
+        neighbor_shifts = all_centers[:, neighbor_start_idx:] - all_centers[:, :neighbor_start_idx]
+        neighbor_distances = neighbor_shifts.norm(dim=-1).clamp(min=1e-8)
+        neighbor_directions = neighbor_shifts / neighbor_distances.unsqueeze(-1)
+        
+        # We compute the standard deviations of the gaussians in the direction of their neighbors,
+        # and reciprocally in the direction of the gaussians.
+        standard_deviations_gaussians = (
+            all_scaling[:, 0:neighbor_start_idx]
+            * quaternion_apply(all_invert_quaternions[:, 0:neighbor_start_idx], 
+                               neighbor_directions)
+            ).norm(dim=-1)
+        
+        standard_deviations_neighbors = (
+            all_scaling[:, neighbor_start_idx:]
+            * quaternion_apply(all_invert_quaternions[:, neighbor_start_idx:], 
+                               neighbor_directions)
+            ).norm(dim=-1)
+        
+        # The distance between the gaussians and their neighbors should be the sum of their standard deviations (up to a factor)
+        stabilized_distance = (standard_deviations_gaussians + standard_deviations_neighbors) * std_factor
+        gaussian_alignment = (neighbor_distances / stabilized_distance.clamp(min=1e-8) - 1.).abs()
+        
+        # If needed, we weight the gaussian alignments by the angle between the normal of the neighbor gaussian and the normal of the point gaussian
+        if weight_by_normal_angle:
+            normals = self.get_normals()[neighbor_idx]  # (n_points, n_neighbors, 3)
+            weights = (normals[:, 1:] * normals[:, 0:1]).sum(dim=-1).abs()  # (n_points, n_neighbors-1)
+            gaussian_alignment = gaussian_alignment * weights
+            
+        return gaussian_alignment
+
+    def get_normals(self, estimate_from_points=False, neighborhood_size:int=32):
+        """Returns the normals of the Gaussians.
+
+        Args:
+            estimate_from_points (bool, optional): _description_. Defaults to False.
+            neighborhood_size (int, optional): _description_. Defaults to 32.
+
+        Returns:
+            _type_: _description_
+        """
+        if estimate_from_points:
+            normals = estimate_pointcloud_normals(
+                self.points[None], #.detach(), 
+                neighborhood_size=neighborhood_size,
+                disambiguate_directions=True
+                )[0]
+        else:
+            if self.binded_to_surface_mesh:
+                normals = torch.nn.functional.normalize(self.surface_mesh.faces_normals_list()[0], dim=-1).view(-1, 1, 3)
+                normals = normals.expand(-1, self.n_gaussians_per_surface_triangle, -1).reshape(-1, 3)
+            else:
+                normals = self.get_smallest_axis()
+        return normals
+    
+    def get_neighbors_of_random_points(self, num_samples):
+        if num_samples >= 0:
+            sampleidx = torch.randperm(len(self.points), device=self.device)[:num_samples]        
+            return self.knn_idx[sampleidx]
+        else:
+            return self.knn_idx
+    
+    def get_local_variance(self, values:torch.Tensor, neighbor_idx:torch.Tensor):
+        """_summary_
+
+        Args:
+            values (_type_): Shape is (n_points, n_values)
+            neighbor_idx (_type_): Shape is (n_points, n_neighbors)
+        """
+        neighbor_values = values[neighbor_idx]  # Shape is (n_points, n_neighbors, n_values)
+        return (neighbor_values - neighbor_values.mean(dim=1, keepdim=True)).pow(2).sum(dim=-1).mean(dim=1)
+    
+    def get_local_distance2(
+        self, 
+        values:torch.Tensor, 
+        neighbor_idx:torch.Tensor, 
+        weights:torch.Tensor=None,
+        ):
+        """_summary_
+
+        Args:
+            values (torch.Tensor): Shape is (n_points, n_values)
+            neighbor_idx (torch.Tensor): Shape is (n_points, n_neighbors)
+            weights (torch.Tensor, optional): Shape is (n_points, n_neighbors). Defaults to None.
+
+        Returns:
+            _type_: _description_
+        """
+        
+        neighbor_values = values[neighbor_idx]  # Shape is (n_points, n_neighbors, n_values)
+        distance2 = neighbor_values[:, 1:] - neighbor_values[:, :1]  # Shape is (n_points, n_neighbors-1, n_values)
+        distance2 = distance2.pow(2).sum(dim=-1)  # Shape is (n_points, n_neighbors-1)
+        
+        if weights is not None:
+            distance2 = distance2 * weights
+
+        return distance2.mean(dim=1)  # Shape is (n_points,)
+    
+    def reset_neighbors(self, knn_to_track:int=None):
+        # Compute KNN               
+        with torch.no_grad():
+            self.knn_to_track = knn_to_track
+            knns = knn_points(self._xyz[None], self._xyz[None], K=knn_to_track)
+            self.knn_dists = knns.dists[0]
+            self.knn_idx = knns.idx[0]
+            
+    def get_edge_neighbors(self, k_neighbors, 
+                           edges=None, triangle_vertices=None,):
+        if edges is None:
+            edges = self.triangle_border_edges
+        if triangle_vertices is None:
+            triangle_vertices = self.triangle_vertices
+        
+        # We select the closest edges based on the position of the edge center
+        edge_centers = triangle_vertices[edges].mean(dim=-2)
+        
+        # TODO: Compute only for vertices with high opacity? Remove points with low opacity?
+        edge_knn = knn_points(edge_centers[None], edge_centers[None], K=8)
+        edge_knn_idx = edge_knn.idx[0]
+        
+        return edge_knn_idx
+
+    def get_smallest_axis(self, return_idx=False):  
+        """Returns the smallest axis of the Gaussians.
+
+        Args:
+            return_idx (bool, optional): _description_. Defaults to False.
+
+        Returns:
+            _type_: _description_
+        """
+        rotation_matrices = quaternion_to_matrix(self.quaternions)
+        smallest_axis_idx = self.scaling.min(dim=-1)[1][..., None, None].expand(-1, 3, -1)
+        smallest_axis = rotation_matrices.gather(2, smallest_axis_idx)
+        if return_idx:
+            return smallest_axis.squeeze(dim=2), smallest_axis_idx[..., 0, 0]
+        return smallest_axis.squeeze(dim=2)
+    
+    def sample_points_in_gaussians(self, num_samples, sampling_scale_factor=1., mask=None,
+                                   probabilities_proportional_to_opacity=False,
+                                   probabilities_proportional_to_volume=True,):
+        """Sample points in the Gaussians.
+
+        Args:
+            num_samples (_type_): _description_
+            sampling_scale_factor (_type_, optional): _description_. Defaults to 1..
+            mask (_type_, optional): _description_. Defaults to None.
+            probabilities_proportional_to_opacity (bool, optional): _description_. Defaults to False.
+            probabilities_proportional_to_volume (bool, optional): _description_. Defaults to True.
+
+        Returns:
+            _type_: _description_
+        """
+        if mask is None:
+            scaling = self.scaling
+        else:
+            scaling = self.scaling[mask]
+        
+        if probabilities_proportional_to_volume:
+            areas = scaling[..., 0] * scaling[..., 1] * scaling[..., 2]
+        else:
+            areas = torch.ones_like(scaling[..., 0])
+        
+        if probabilities_proportional_to_opacity:
+            if mask is None:
+                areas = areas * self.strengths.view(-1)
+            else:
+                areas = areas * self.strengths[mask].view(-1)
+        areas = areas.abs()
+        # cum_probs = areas.cumsum(dim=-1) / areas.sum(dim=-1, keepdim=True)
+        cum_probs = areas / areas.sum(dim=-1, keepdim=True)
+        
+        random_indices = torch.multinomial(cum_probs, num_samples=num_samples, replacement=True)
+        if mask is not None:
+            valid_indices = torch.arange(self.n_points, device=self.device)[mask]
+            random_indices = valid_indices[random_indices]
+        
+        random_points = self.points[random_indices] + quaternion_apply(
+            self.quaternions[random_indices], 
+            sampling_scale_factor * self.scaling[random_indices] * torch.randn_like(self.points[random_indices]))
+        
+        return random_points, random_indices
+    
+    def drop_low_opacity_points(self, opacity_threshold=0.5):
+        mask = self.strengths[..., 0] > opacity_threshold  # 1e-3, 0.5
+        self.prune_points(mask)
+    
+    
+    pass

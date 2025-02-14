@@ -47,12 +47,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
-    gaussians.training_setup(opt)
+    gaussians_init = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    scene = Scene(dataset, gaussians_init)
+    gaussians_init.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+        gaussians_init.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -78,7 +78,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image = render(custom_cam, gaussians_init, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -88,6 +88,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
+        # build our representation
+        if iteration == opt.iter_build_stprs:   # build stprs from inital gaussians
+            stprs = gaussians_init.build_stprs_from_gs(num_clusters=50)
+            stprs.training_setup(opt)
+            process_state = "stprs"
+        if iteration == opt.iter_build_appgs:# build appgs from stprs
+            appgs = gaussians_init.build_appgs_from_stprs(num_clusters=50)
+            appgs.training_setup(opt)
+            process_state = "appgs"
+        if iteration<opt.iter_build_stprs:
+            gaussians = gaussians_init
+        elif iteration >= opt.iter_build_stprs and iteration < opt.iter_build_appgs:
+            gaussians = stprs
+        else:
+            gaussians = appgs
+        
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -166,7 +182,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and process_state != "stprs":
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
