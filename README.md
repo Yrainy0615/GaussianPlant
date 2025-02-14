@@ -1,5 +1,4 @@
-# 3D Gaussian Splatting for Real-Time Radiance Field Rendering
-Yang Yang, Fumio Okura<br>
+# GaussianPlant: Structure-Aligned Gaussian Splatting for Plant Structure ExtractionYang Yang, Fumio Okura<br>
 | [Webpage](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) | [Full Paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/3d_gaussian_splatting_high.pdf) | <br>
 This repository contains the official authors implementation associated with the paper "GaussianPlant: Structure-Aligned Gaussian Splatting for Plant Structure Extraction", which can be found [here](https://github.com/Yrainy0615/GaussianPlant.git). <br>
 <a href="http://cvl.ist.osaka-u.ac.jp/en/"><img height="100" src="assets/osaka_logo.png"> </a>
