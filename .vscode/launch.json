@@ -8,7 +8,10 @@
           "program": "${workspaceFolder}/train.py",
           "console": "integratedTerminal",
           "args": [
-              "-s", "data/plant3"
+              "-s", "data/plant4_blender",
+              "-m", "output/plant4_blender",
+              "--gpu", "7",
+              "--port", "6007"
           ],
           "justMyCode": true
       }

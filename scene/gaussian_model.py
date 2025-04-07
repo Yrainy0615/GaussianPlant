@@ -8,7 +8,7 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+from typing import Literal
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -23,8 +23,16 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scipy.spatial.transform import Rotation as R
 from sklearn.cluster import KMeans
+import faiss
 from pytorch3d.transforms import quaternion_to_matrix, quaternion_invert, quaternion_apply
 from pytorch3d.ops import knn_points, estimate_pointcloud_normals
+import networkx as nx
+from scipy.spatial import cKDTree
+from plyfile import PlyData, PlyElement
+import trimesh
+from utils.gs_utils import fit_cylinder_ransac, estimate_gs_para_from_cluster, branch_to_cylinder
+import time
+
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
@@ -50,11 +58,12 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, optimizer_type="default", device=None):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
+        self._mask = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
         self._scaling = torch.empty(0)
@@ -64,12 +73,18 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        self.device = device
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self.knn_to_track = 16
+        self.knn_to_track = 4
         self.setup_functions()
         self.knn_dists = None
         self.knn_idx = None
+        self.n_points = None
+        self.nn_stpr_app = None
+        self.structure_gs = None
+        self.appgs = None
+        
     def capture(self):
         return (
             self.active_sh_degree,
@@ -79,22 +94,26 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self._mask,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.n_points
         )
     
     def restore(self, model_args, training_args):
         (self.active_sh_degree, 
         self._xyz, 
+        self._mask,
         self._features_dc, 
         self._features_rest,
         self._scaling, 
         self._rotation, 
         self._opacity,
         self.max_radii2D, 
+        self.n_points,
         xyz_gradient_accum, 
         denom,
         opt_dict, 
@@ -103,6 +122,7 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        
 
     @property
     def get_scaling(self):
@@ -115,6 +135,10 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+    
+    @property
+    def get_n_points(self):
+        return len(self._xyz)
     
     @property
     def get_features(self):
@@ -138,14 +162,37 @@ class GaussianModel:
     def get_exposure(self):
         return self._exposure
 
+    @property
+    def get_mask(self):
+        return self._mask
+
+    def opacity_regularizer(self):
+        return torch.mean(self.get_opacity * (1 - self.get_opacity))
+    
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
             return self._exposure[self.exposure_mapping[image_name]]
         else:
             return self.pretrained_exposures[image_name]
     
-    def get_covariance(self, scaling_modifier = 1):
-        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+    def get_covariance(self, scaling_modifier = 1, return_full = False):
+        if not return_full:
+            return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+        else:
+            cov = self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+            cov_full = torch.zeros((cov.shape[0], 3, 3), device=self.device)
+            cov_full[:, 0, 0] = cov[:, 0]
+            cov_full[:, 1, 1] = cov[:, 3]
+            cov_full[:, 2, 2] = cov[:, 5]
+            cov_full[:, 0, 1] = cov[:, 1]
+            cov_full[:, 0, 2] = cov[:, 2]
+            cov_full[:, 1, 2] = cov[:, 4]
+            cov_full[:, 1, 0] = cov[:, 1]
+            cov_full[:, 2, 0] = cov[:, 2]
+            cov_full[:, 2, 1] = cov[:, 4]
+            return cov_full
+
+
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -163,10 +210,10 @@ class GaussianModel:
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device=self.device)
         rots[:, 0] = 1
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device=self.device))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -174,16 +221,18 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
+        self._mask = torch.ones((self._xyz.shape[0],), dtype=torch.float, device=self.device)
         self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
+        self.n_points = len(self._xyz)
+        exposure = torch.eye(3, 4, device=self.device)[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -264,6 +313,12 @@ class GaussianModel:
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
+    
+    def reset_opacity_stpr(self):
+        # set opacity to 1
+        opacities_new = self.inverse_opacity_activation(torch.ones_like(self.get_opacity)*0.5)
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
 
     def load_ply(self, path, use_train_test_exp = False):
         plydata = PlyData.read(path)
@@ -309,12 +364,12 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device=self.device).requires_grad_(True))
+        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device=self.device).transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device=self.device).transpose(1, 2).contiguous().requires_grad_(True))
+        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device=self.device).requires_grad_(True))
+        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device=self.device).requires_grad_(True))
+        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device=self.device).requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -407,21 +462,21 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad = torch.zeros((n_init_points), device=self.device)
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
+        means =torch.zeros((stds.size(0), 3),device=self.device)
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
@@ -434,7 +489,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
-        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device=self.device, dtype=bool)))
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
@@ -454,22 +509,31 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, only_prune=False,size_threshold_small=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        if not only_prune:
+            self.densify_and_clone(grads, max_grad, extent)
+            self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_low_opacity_count = prune_mask.sum()
+        prune_large_count = 0
+        prune_small_count = 0
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            prune_large_count = torch.logical_or(big_points_vs, big_points_ws).sum()
+        if size_threshold_small:
+            small_points_ws = self.get_scaling.max(dim=1).values < 0.05 * extent
+            prune_mask = torch.logical_or(prune_mask, small_points_ws)
+            prune_small_count = small_points_ws.sum()
         self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
-        self.tmp_radii = None
+        # print(f"Pruned {prune_low_opacity_count} points with low opacity, {prune_large_count} points with large screen size, {prune_small_count} points with small screen size.")
+
 
         torch.cuda.empty_cache()
 
@@ -477,114 +541,261 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def build_stprs_from_gs(self, num_clusters):
+    def build_stprs_from_gs(self, num_clusters=100,method: Literal['kmeans', 'random', '3dgs'] = '3dgs'):
         """
-        Build structural primitives (StPrs) from optimized Gaussians by clustering them.
-        :param num_clusters: Number of clusters for grouping Gaussians into structural primitives.
+        structural primitives (StPrs) from optimized Gaussians by clustering them.
+        param num_clusters: Number of clusters for grouping Gaussians into structural primitives.
         """
+        print(f"Building {num_clusters} structural primitives using {method} method.")
         # Extract Gaussian properties
         xyz = self._xyz.detach().cpu().numpy()  # Gaussian positions
         scaling = self.get_scaling.detach().cpu().numpy()  # Gaussian scales
         rotation = self.get_rotation.detach().cpu().numpy()  # Gaussian rotations
         covariance = self.get_covariance().detach().cpu().numpy()  # Gaussian covariance matrices
-
-        # Flatten covariance matrices for clustering
-        covariances_flat = covariance.reshape(covariance.shape[0], -1)
-        feature_vectors = np.hstack((xyz, covariances_flat))  # Include covariance in clustering
-
-        # Apply clustering to Gaussian positions and covariance
-        kmeans = KMeans(n_clusters=num_clusters, random_state=0).fit(feature_vectors)
-        cluster_labels = kmeans.labels_
-        cluster_centers = kmeans.cluster_centers_[:, :3]  # Extract only position components
-
+        feature = self.get_features.detach().cpu().numpy()  # Gaussian features
+        feature_dc = self.get_features_dc.detach().cpu().numpy()  # Gaussian features
+        feature_rest = self.get_features_rest.detach().cpu().numpy()  # Gaussian features
         # Initialize lists for StPr parameters
         stpr_positions = []
         stpr_scales = []
         stpr_rotations = []
+        branch_positions = []
+        branch_scales = []
+        branch_rotations = []
+        branch_points_all = []
+        if method == 'kmeans':
+            # Flatten covariance matrices for clustering
+            covariances_flat = covariance.reshape(covariance.shape[0], -1)
+            feature_vectors = np.hstack((xyz, covariances_flat))  # Include covariance in clustering
+            # Use faiss for clustering
+            kmeans = faiss.Kmeans(d=feature_vectors.shape[1], k=num_clusters, niter=20, nredo=5,gpu=True)
+            kmeans.train(feature_vectors.astype(np.float32))
+            cluster_labels = kmeans.index.search(feature_vectors.astype(np.float32), 1)[1].flatten()
 
-        for cluster_id in range(num_clusters):
-            cluster_points = xyz[cluster_labels == cluster_id]
-            cluster_scales = scaling[cluster_labels == cluster_id]
-            cluster_rotations = rotation[cluster_labels == cluster_id]
+            for cluster_id in range(num_clusters):
+                cluster_points = xyz[cluster_labels == cluster_id]
+                cluster_scales = scaling[cluster_labels == cluster_id]
+                cluster_rotations = rotation[cluster_labels == cluster_id]
 
-            if len(cluster_points) > 1:
-                # Compute PCA for scaling & rotation estimation
-                mean = np.mean(cluster_points, axis=0)
-                centered = cluster_points - mean
-                cov = np.dot(centered.T, centered) / len(cluster_points)
-                eigvals, eigvecs = np.linalg.eigh(cov)
+                if len(cluster_points) > 1:
+                    # Compute PCA for scaling & rotation estimation
+                    mean,stpr_rot, stpr_scale = estimate_gs_para_from_cluster(cluster_points)
 
-                # Use PCA eigenvectors as orientation
-                stpr_rot = R.from_matrix(eigvecs).as_quat()
-                stpr_scale = np.sqrt(eigvals).clip(min=0.01)  # Ensure valid scale values
-            else:
-                # If only one point in cluster, use its existing rotation and scale
-                mean = cluster_points[0]
-                stpr_rot = cluster_rotations[0]
-                stpr_scale = cluster_scales[0]
+                stpr_positions.append(mean)
+                stpr_scales.append(stpr_scale)
+                stpr_rotations.append(stpr_rot)
+        elif method == 'random':
+            pass
+        elif method == '3dgs':
+            """
+            Build structural primitives (StPrs) from optimized Gaussians using 3D Gaussian clustering.
+            Using segmented leaf&branch points information for initialize leaf stpr(disk) and branch stpr(cylinder).
+            """
+            label_leaf, label_branch, labels = fit_cylinder_ransac(xyz, save_ply=True)
+            for label in np.unique(labels):
+                if label in label_leaf:
+                    # build disk gs
+                    leaf_points = xyz[labels == label]
+                    mean,stpr_rot, stpr_scale = estimate_gs_para_from_cluster(leaf_points,test_flag=True)
+                    stpr_scale[2] = 1e-6
+                    stpr_positions.append(mean)
+                    stpr_scales.append(stpr_scale)
+                    stpr_rotations.append(stpr_rot)
+                    
+                elif label in label_branch:
+                    # build 3dgs
+                    branch_points = xyz[labels == label]
+                    mean,stpr_rot, stpr_scale = estimate_gs_para_from_cluster(branch_points,test_flag=True)
+                    stpr_scales.append(stpr_scale)
+                    stpr_rotations.append(stpr_rot)
+                    stpr_positions.append(mean)
+                    # record branch stprs for later use
+                    branch_positions.append(mean)
+                    branch_scales.append(stpr_scale)
+                    branch_rotations.append(stpr_rot)
+                    branch_points_all.append(branch_points)
+                    # build cylinder gs
+            branch_to_cylinder( branch_points=np.vstack(branch_points_all),branch_positions=branch_positions,
+                               branch_scales=branch_scales, branch_rotations=branch_rotations)
+                    
+                    
 
-            stpr_positions.append(mean)
-            stpr_scales.append(stpr_scale)
-            stpr_rotations.append(stpr_rot)
+        
+        else:
+            raise ValueError("Unknown clustering method. Use 'pca' or 'random'.")
 
         # Convert lists to tensors
-        stpr_positions = torch.tensor(np.array(stpr_positions), dtype=torch.float, device="cuda")
-        stpr_scales = torch.tensor(np.array(stpr_scales), dtype=torch.float, device="cuda")
-        stpr_rotations = torch.tensor(np.array(stpr_rotations), dtype=torch.float, device="cuda")
-
+        rot_torch3d = np.roll(np.array(stpr_rotations), 1, axis=1)
+        stpr_positions = torch.tensor(np.array(stpr_positions), dtype=torch.float, device=self.device)
+        stpr_scales = torch.tensor(np.array(stpr_scales), dtype=torch.float, device=self.device)
+        stpr_rotations = torch.tensor(rot_torch3d, dtype=torch.float, device=self.device)
+        # check nan in stpr_scales, replace nan with 0.1
+        stpr_scales[torch.isnan(stpr_scales)] = 0.1
+        
+        # scale filter for the stpr to remove background large gs
+        scale_filter = stpr_scales.max(dim=1).values< 1
+        stpr_positions = stpr_positions[scale_filter]
+        stpr_scales = stpr_scales[scale_filter]
+        stpr_scales = torch.log(stpr_scales)
+        stpr_rotations = stpr_rotations[scale_filter]
+        stpr_opacities = self.inverse_opacity_activation( 0.1* torch.ones((stpr_positions.shape[0], 1),device=self.device))
         # Initialize a new GaussianModel for StPrs and return it
-        self.structure_gs = GaussianModel(sh_degree=self.max_sh_degree, divide_ratio=self.divide_ratio)
+        self.structure_gs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type, device=self.device)
         self.structure_gs._xyz = nn.Parameter(stpr_positions.requires_grad_(True))
         self.structure_gs._scaling = nn.Parameter(stpr_scales.requires_grad_(True))
         self.structure_gs._rotation = nn.Parameter(stpr_rotations.requires_grad_(True))
-        self.structure_gs._features_dc = nn.Parameter(torch.zeros((stpr_positions.shape[0], 1, 3), device="cuda").requires_grad_(True))
-        self.structure_gs._features_rest = nn.Parameter(torch.zeros((stpr_positions.shape[0], 15, 3), device="cuda").requires_grad_(True))
-        self.structure_gs._opacity = nn.Parameter(torch.ones((stpr_positions.shape[0], 1), device="cuda").requires_grad_(True))
-        self.structure_gs.max_radii2D = torch.zeros((stpr_positions.shape[0]), device="cuda")
-        
+        self.structure_gs._features_dc = nn.Parameter(torch.ones((stpr_positions.shape[0], 1, 3), device=self.device).requires_grad_(True))
+        self.structure_gs._features_rest = nn.Parameter(torch.ones((stpr_positions.shape[0], 15, 3), device=self.device).requires_grad_(True))
+        self.structure_gs._opacity = nn.Parameter(stpr_opacities).requires_grad_(True)
+        self.structure_gs.max_radii2D = torch.zeros((stpr_positions.shape[0]), device=self.device)
+        self.structure_gs._mask = torch.ones((stpr_positions.shape[0],), dtype=torch.float, device=self.device)
+        self.structure_gs.exposure_mapping = self.exposure_mapping
+        self.structure_gs.pretrained_exposures = None
+        exposure = self._exposure.detach()
+        self.structure_gs._exposure = nn.Parameter(exposure.requires_grad_(True))
 
-        print(f"Initialized {num_clusters} Structural Primitives (StPrs) from Gaussian clustering.")
+        print(f"Initialized {len(stpr_positions)} Structural Primitives (StPrs) from Gaussian clustering.")
         return self.structure_gs
 
     
     def build_appgs_from_stprs(self, samples_per_stgs=10):
         if self.structure_gs is not None:
-            points_st = self.structure_gs._xyz.detach()
-            quaternions_st = self.structure_gs._rotation.detach()
-            scaling_st = self.structure_gs._scaling.detach()
+            points_st = self.structure_gs._xyz
+            quaternions_st = self.structure_gs._rotation
+            scaling_st = self.structure_gs._scaling
             gaussian_samples = points_st.unsqueeze(1) + quaternion_apply(
                 quaternions_st.unsqueeze(1), 
                 scaling_st.unsqueeze(1) * torch.randn(
-                    points_st.shape[0], samples_per_stgs, 3, device="cuda"))
+                    points_st.shape[0], samples_per_stgs, 3, device=self.device))
         
             # init gaussian parameters 
             new_means = gaussian_samples.reshape(-1,3)
             scales = scaling_st.unsqueeze(1).repeat(1, samples_per_stgs, 1) / samples_per_stgs
             scales[:, :,-1] = 1e-6
             scales= scales.reshape(-1,3)
+            # scales = torch.log(scales)
             rots = quaternions_st.unsqueeze(1).repeat(1, samples_per_stgs, 1)
             rots = rots.reshape(-1,4)
             # init features
-            features_dc = self.structure_gs._features_dc.detach().unsqueeze(1).repeat(1, samples_per_stgs, 1, 1).reshape(-1,1,3)
+            features_dc = self.structure_gs._features_dc.unsqueeze(1).repeat(1, samples_per_stgs, 1, 1).reshape(-1,1,3)
             # assign features to each gaussian from the same structure
-            features_rest = self.structure_gs._features_rest.detach().unsqueeze(1).repeat(1, samples_per_stgs, 1, 1).reshape(-1,15,3)
+            features_rest = self.structure_gs._features_rest.unsqueeze(1).repeat(1, samples_per_stgs, 1, 1).reshape(-1,15,3)
             # init opacity
-            new_opacities = self.structure_gs._opacity.unsqueeze(1).repeat(1, samples_per_stgs, 1).reshape(-1,1)    
+            # new_opacities = self.structure_gs._opacity.unsqueeze(1).repeat(1, samples_per_stgs, 1).reshape(-1,1)    
+            new_opacities = self.inverse_opacity_activation(0.1 * torch.ones((new_means.shape[0], 1), dtype=torch.float, device=self.device))
             # Set Gaussian parameters
-            self.appgs = GaussianModel(sh_degree=self.max_sh_degree, divide_ratio=self.divide_ratio)
+            self.appgs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type,device=self.device)
             self.appgs._xyz = nn.Parameter(new_means.requires_grad_(True))
             self.appgs._scaling = nn.Parameter(scales.requires_grad_(True))
             self.appgs._rotation = nn.Parameter(rots.requires_grad_(True))
             self.appgs._features_dc = nn.Parameter(features_dc.requires_grad_(True))
             self.appgs._features_rest = nn.Parameter(features_rest.requires_grad_(True))
             self.appgs._opacity = nn.Parameter(new_opacities.requires_grad_(True))
-            self.appgs.max_radii2D = torch.zeros((new_means.shape[0]), device="cuda")
+            self.appgs.max_radii2D = torch.zeros((new_means.shape[0]), device=self.device)
+            self.appgs._mask = torch.ones((new_means.shape[0],), dtype=torch.float, device=self.device)
+            self.appgs.exposure_mapping = self.exposure_mapping
+            self.appgs.pretrained_exposures = None
+            self.appgs.nn_stpr_app
+            exposure = self._exposure.detach()
+            self.appgs._exposure = nn.Parameter(exposure.requires_grad_(True))
+            print(f"Initialized {new_means.shape[0]} Appearance Gaussians (AppGs) from Structural Primitives (StPrs).")
             return self.appgs
 
 
 
         else: 
                 print("No structure to bind to")
+
+    def build_appgs_from_cylinder(self, cylinder_params, num_samples=50):
+        """
+        Build Appearance Gaussians (AppGs) by uniformly sampling points on the surface of the cylinder.
+        
+        Args:
+            cylinder_params (dict): Dictionary containing cylinder parameters (center, axis, radius, height).
+            num_samples (int): Number of samples to generate.
+        
+        Returns:
+            GaussianModel: Initialized AppGs.
+        """
+        # Extract cylinder parameters
+        C = cylinder_params["center"]  # (N, 3)
+        A = cylinder_params["axis"]    # (N, 3)
+        R = cylinder_params["radius"]  # (N,)
+        H = cylinder_params["height"]  # (N,)
+
+        # Normalize the axis vector
+        A = A / torch.norm(A, dim=-1, keepdim=True)
+
+        # Sample points on the top and bottom circles
+        num_circle_samples = num_samples // 3
+        theta = torch.linspace(0, 2 * torch.pi, num_circle_samples, device=self.device)  # (num_circle_samples,)
+        circle_x = torch.cos(theta) * R[:, None]  # (N, num_circle_samples)
+        circle_y = torch.sin(theta) * R[:, None]  # (N, num_circle_samples)
+
+        # Compute two orthogonal vectors to the axis
+        v1 = torch.tensor([1, 0, 0], device=self.device).repeat(A.shape[0], 1)
+        v1 = v1 - (torch.sum(v1 * A, dim=-1, keepdim=True) * A)
+        v1 = v1 / torch.norm(v1, dim=-1, keepdim=True)
+
+        v2 = torch.cross(A, v1)  # Get the second orthogonal vector
+
+        # Compute the points on the circles
+        top_center = C + (H[:, None] / 2) * A
+        bottom_center = C - (H[:, None] / 2) * A
+
+        circle_points_top = top_center[:, None, :] + circle_x[:, :, None] * v1[:, None, :] + circle_y[:, :, None] * v2[:, None, :]
+        circle_points_bottom = bottom_center[:, None, :] + circle_x[:, :, None] * v1[:, None, :] + circle_y[:, :, None] * v2[:, None, :]
+
+        # Sample points on the side surface
+        num_side_samples = num_samples - 2 * num_circle_samples
+        side_theta = torch.linspace(0, 2 * torch.pi, num_side_samples, device=self.device)
+        z_offsets = torch.linspace(-0.5, 0.5, num_side_samples, device=self.device) * H[:, None]
+
+        side_x = torch.cos(side_theta) * R[:, None]
+        side_y = torch.sin(side_theta) * R[:, None]
+        side_z = z_offsets
+
+        side_points = C[:, None, :] + side_x[:, :, None] * v1[:, None, :] + side_y[:, :, None] * v2[:, None, :] + side_z[:, :, None] * A[:, None, :]
+
+        # Combine all sampled points
+        sampled_points = torch.cat([circle_points_top, circle_points_bottom, side_points], dim=1).reshape(-1, 3)
+
+        # Initialize Appearance Gaussians (AppGs)
+        num_total_samples = sampled_points.shape[0]
+        scaling_st = self.structure_gs._scaling
+        scales = scaling_st.unsqueeze(1).repeat(1, num_samples, 1) / num_samples
+
+        scales= scales.reshape(-1,3)
+        # set all scale to -1 
+        scales = torch.log(scales)
+        scales[torch.isnan(scales)] = -3
+        quaternion_st = self.structure_gs._rotation
+        rots = quaternion_st.unsqueeze(1).repeat(1, num_samples, 1)
+        rots = rots.reshape(-1,4)
+        # init features
+        features_dc = self.structure_gs._features_dc.unsqueeze(1).repeat(1, num_samples, 1, 1).reshape(-1,1,3)
+        # assign features to each gaussian from the same structure
+        features_rest = self.structure_gs._features_rest.unsqueeze(1).repeat(1, num_samples, 1, 1).reshape(-1,15,3)
+        # init opacity
+        # new_opacities = self.structure_gs._opacity.unsqueeze(1).repeat(1, samples_per_stgs, 1).reshape(-1,1)    
+        new_opacities = self.inverse_opacity_activation(0.1 * torch.ones((sampled_points.shape[0], 1), dtype=torch.float, device=self.device))
+        # new_opacities = torch.ones((sampled_points.shape[0], 1), dtype=torch.float, device=self.device)
+        self.appgs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type, device=self.device)
+        self.appgs._xyz = nn.Parameter(sampled_points.requires_grad_(True))
+        self.appgs._scaling = nn.Parameter(scales.requires_grad_(True))
+        self.appgs._rotation = nn.Parameter(rots.requires_grad_(True))
+        self.appgs._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+        self.appgs._features_rest = nn.Parameter(features_rest.requires_grad_(True))
+        self.appgs._opacity = nn.Parameter(new_opacities.requires_grad_(True))
+        self.appgs.max_radii2D = torch.zeros((sampled_points.shape[0]), device=self.device)
+        self.appgs._mask = torch.ones((num_total_samples,), dtype=torch.float, device=self.device)
+        self.appgs.exposure_mapping = self.exposure_mapping
+        self.appgs.pretrained_exposures = None
+        exposure = self._exposure.detach()
+        self.appgs._exposure = nn.Parameter(exposure.requires_grad_(True))
+
+        # print(f"Initialized {num_total_samples} Appearance Gaussians (AppGs) from Cylinder Surface.")
+        return self.appgs
 
     def compute_gaussian_overlap_with_neighbors(
         self, 
@@ -604,18 +815,18 @@ class GaussianModel:
         
         # Decide whether we want to propagate the gradient to the points only, or to the points and the covariance parameters
         if propagate_gradient_to_points_only:
-            scaling = self.scaling.detach()
-            quaternions = self.quaternions.detach()
+            scaling = self._scaling.detach()
+            quaternions = self._rotation.detach()
         else:
-            scaling = self.scaling
-            quaternions = self.quaternions
+            scaling = self._scaling
+            quaternions = self._rotation
         
         # Samples points in the corresponding gaussians
         if use_gaussian_center_only:
             n_samples_to_compute_overlap = 1
-            gaussian_samples = self.points[point_idx].unsqueeze(1) + 0.  # (n_points, n_samples_to_compute_overlap, 3)
+            gaussian_samples = self._xyz[point_idx].unsqueeze(1) + 0.  # (n_points, n_samples_to_compute_overlap, 3)
         else:
-            gaussian_samples = self.points[point_idx].unsqueeze(1) + quaternion_apply(
+            gaussian_samples = self._xyz[point_idx].unsqueeze(1) + quaternion_apply(
                 quaternions[point_idx].unsqueeze(1), 
                 scaling[point_idx].unsqueeze(1) * torch.randn(
                     n_points, n_samples_to_compute_overlap, 3, 
@@ -624,7 +835,7 @@ class GaussianModel:
         
         # >>> We will now compute the gaussian weight of all samples, for each neighbor gaussian.
         # We start by computing the shift between the samples and the neighbor gaussian centers.
-        neighbor_center_to_samples = gaussian_samples.unsqueeze(1) - self.points[neighbor_idx[:, neighbor_start_idx:]].unsqueeze(2)  # (n_points, n_neighbors-1, n_samples_to_compute_overlap, 3)
+        neighbor_center_to_samples = gaussian_samples.unsqueeze(1) - self._xyz[neighbor_idx[:, neighbor_start_idx:]].unsqueeze(2)  # (n_points, n_neighbors-1, n_samples_to_compute_overlap, 3)
         
         # We compute the inverse of the scaling of the neighbor gaussians. 
         # For 2D gaussians, we implictly project the samples on the plane of each gaussian; 
@@ -663,21 +874,21 @@ class GaussianModel:
         neighbor_start_idx = 1
         
         # Get sampled points
-        point_idx = neighbor_idx[:, 0]  # (n_points, )
+        point_idx = neighbor_idx[:,]  # (n_points, )
         n_points = len(point_idx)
         
         # Decide whether we want to propagate the gradient to the points only, or to the points and the covariance parameters
         if propagate_gradient_to_points_only:
-            scaling = self.scaling.detach()
-            quaternions = self.quaternions.detach()
+            scaling = self._scaling.detach()
+            quaternions = self._rotation.detach()
         else:
-            scaling = self.scaling
-            quaternions = self.quaternions
+            scaling = self._scaling
+            quaternions = self._rotation
         
         # We compute scaling, inverse quaternions and centers for all gaussians and their neighbors
         all_scaling = scaling[neighbor_idx]
         all_invert_quaternions = quaternion_invert(quaternions)[neighbor_idx]
-        all_centers = self.points[neighbor_idx]
+        all_centers = self._xyz[neighbor_idx]
         
         # We compute direction vectors between the gaussians and their neighbors
         neighbor_shifts = all_centers[:, neighbor_start_idx:] - all_centers[:, :neighbor_start_idx]
@@ -736,7 +947,7 @@ class GaussianModel:
     
     def get_neighbors_of_random_points(self, num_samples):
         if num_samples >= 0:
-            sampleidx = torch.randperm(len(self.points), device=self.device)[:num_samples]        
+            sampleidx = torch.randperm(len(self._xyz), device=self.device)[:num_samples]        
             return self.knn_idx[sampleidx]
         else:
             return self.knn_idx
@@ -777,14 +988,19 @@ class GaussianModel:
 
         return distance2.mean(dim=1)  # Shape is (n_points,)
     
-    def reset_neighbors(self, knn_to_track:int=None):
+    def reset_neighbors(self):
         # Compute KNN               
         with torch.no_grad():
-            self.knn_to_track = knn_to_track
-            knns = knn_points(self._xyz[None], self._xyz[None], K=knn_to_track)
+            knns = knn_points(self._xyz[None], self._xyz[None], K=self.knn_to_track)
             self.knn_dists = knns.dists[0]
             self.knn_idx = knns.idx[0]
-            
+
+    def get_nn_between_appgs_and_stprs(self):
+        app_points = self.appgs._xyz
+        stpr_points = self.structure_gs._xyz
+        knns = knn_points(app_points[None], stpr_points[None], K=1)
+        return knns.idx[0]
+    
     def get_edge_neighbors(self, k_neighbors, 
                            edges=None, triangle_vertices=None,):
         if edges is None:
@@ -810,8 +1026,8 @@ class GaussianModel:
         Returns:
             _type_: _description_
         """
-        rotation_matrices = quaternion_to_matrix(self.quaternions)
-        smallest_axis_idx = self.scaling.min(dim=-1)[1][..., None, None].expand(-1, 3, -1)
+        rotation_matrices = quaternion_to_matrix(self._rotation)
+        smallest_axis_idx = self._scaling.min(dim=-1)[1][..., None, None].expand(-1, 3, -1)
         smallest_axis = rotation_matrices.gather(2, smallest_axis_idx)
         if return_idx:
             return smallest_axis.squeeze(dim=2), smallest_axis_idx[..., 0, 0]
@@ -833,9 +1049,9 @@ class GaussianModel:
             _type_: _description_
         """
         if mask is None:
-            scaling = self.scaling
+            scaling = self._scaling
         else:
-            scaling = self.scaling[mask]
+            scaling = self._scaling[mask]
         
         if probabilities_proportional_to_volume:
             areas = scaling[..., 0] * scaling[..., 1] * scaling[..., 2]
@@ -856,15 +1072,262 @@ class GaussianModel:
             valid_indices = torch.arange(self.n_points, device=self.device)[mask]
             random_indices = valid_indices[random_indices]
         
-        random_points = self.points[random_indices] + quaternion_apply(
-            self.quaternions[random_indices], 
-            sampling_scale_factor * self.scaling[random_indices] * torch.randn_like(self.points[random_indices]))
+        random_points = self._xyz[random_indices] + quaternion_apply(
+            self._rotation[random_indices], 
+            sampling_scale_factor * self._scaling[random_indices] * torch.randn_like(self._xyz[random_indices]))
         
         return random_points, random_indices
     
     def drop_low_opacity_points(self, opacity_threshold=0.5):
-        mask = self.strengths[..., 0] > opacity_threshold  # 1e-3, 0.5
+        mask = self.get_opacity[...,0] < opacity_threshold  # 1e-3, 0.5
         self.prune_points(mask)
+        print(f"Dropped {mask.sum()} points with opacity below {opacity_threshold}.")
+        print(f"""Remaining points: {len(self._xyz)}""")
     
     
-    pass
+    def convert_gs_to_cylinders(self, sigma=3.0):
+        cov = self.get_covariance(return_full=True)
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+        lambda1, lambda2, lambda3 = eigenvalues[..., 0], eigenvalues[..., 1], eigenvalues[..., 2]
+        radius = (sigma * torch.sqrt(torch.maximum(lambda1, lambda2)))
+        axis = eigenvectors[:, :, 2]  # (N, 3)
+        height = (sigma * torch.sqrt(lambda3))
+        center = self._xyz
+        cylinder_params = {
+            "center": center,
+            "axis": axis,
+            "radius": radius,
+            "height": height,
+        }
+        return cylinder_params
+
+    def gs_to_graph(self, k=3, filename="gaussian_graph.ply"):
+        """
+        Save Structural Gaussians (StPrs) as a PLY file with edges based on nearest neighbors.
+
+        Parameters:
+        - stprs_xyz (torch.Tensor): Tensor of shape (N, 3), Gaussian center positions.
+        - k (int): Number of nearest neighbors to connect.
+        - filename (str): Output file name for the PLY file.
+        """
+        # Ensure tensor is detached and converted to numpy
+        xyz = self._xyz.detach().cpu().numpy()
+        num_points = xyz.shape[0]
+
+        # Compute k-nearest neighbors
+        tree = cKDTree(xyz)
+        distances, indices = tree.query(xyz, k=k+1)  # k+1 to include self, will remove later
+
+        # Prepare vertex data
+        vertices = [(xyz[i][0], xyz[i][1], xyz[i][2]) for i in range(num_points)]
+
+        # Prepare edge data (store as list of tuples)
+        edges = []
+        for i in range(num_points):
+            for j in indices[i][1:]:  # Skip self-connection (first index)
+                edges.append((i, j))
+
+        # Convert to NumPy structured arrays
+        vertex_dtype = np.dtype([("x", "f4"), ("y", "f4"), ("z", "f4")])
+        edge_dtype = np.dtype([("vertex1", "i4"), ("vertex2", "i4")])
+
+        vertex_array = np.array(vertices, dtype=vertex_dtype)
+        edge_array = np.array(edges, dtype=edge_dtype)
+
+        # Create PLY elements
+        vertex_element = PlyElement.describe(vertex_array, "vertex")
+        edge_element = PlyElement.describe(edge_array, "edge")
+
+        # Save to PLY file
+        PlyData([vertex_element, edge_element], text=True).write(filename)
+        print(f"PLY file saved as {filename}")
+        
+
+    def gs_cylinder_distance(self, nn_index, cylinder_params):
+        # Extract Gaussian parameters
+        C = cylinder_params["center"][nn_index].squeeze(1)  # (M, 3) Nearest cylinder centers
+        A = cylinder_params["axis"][nn_index].squeeze(1)    # (M, 3) Nearest cylinder axes
+        R = cylinder_params["radius"][nn_index].squeeze(1)  # (M,) Nearest cylinder radii
+        H = cylinder_params["height"][nn_index].squeeze(1)  # (M,) Nearest cylinder heights
+
+        # Extract AppG positions
+        P = self._xyz  # (M, 3) AppG center positions
+
+        # Step 1: Project AppG centers onto the cylinder axis
+        AP = P - C  # (M, 3) Vector from cylinder center to AppG
+        proj_scalar = torch.sum(AP * A, dim=-1)  # (M,) Projection length along axis
+        proj_point = C + proj_scalar.unsqueeze(-1) * A  # (M, 3) Projected points on the cylinder axis
+
+        # Step 2: Compute radial distance from projected point to AppG
+        radial_vector = P - proj_point  # (M, 3)
+        radial_distance = torch.norm(radial_vector, dim=-1)  # (M,)
+        distance_to_surface = radial_distance - R  # (M,)
+        return distance_to_surface.mean()
+    
+    def low_freq_loss(self):
+        cov = self.get_covariance(return_full=True)
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+        freq = 1.0 / torch.sqrt(eigenvalues+ 1e-6)
+        return freq.mean() 
+    # 443889037454
+    def merge_gaussians(self, gaussian_overlaps, nn_index,threshold=0.5):
+        """
+        Merge Gaussians in a GaussianModel based on overlap.
+
+        Args:
+            gaussian_model: GaussianModel instance
+            gaussian_overlaps (torch.Tensor): (N, N) overlap matrix.
+            threshold (float): Overlap threshold for merging.
+        """
+        clusters = self.find_merge_groups(gaussian_overlaps, threshold)
+
+        new_xyz = []
+        new_scaling = []
+        new_rotation = []
+        new_opacity = []
+        new_features_dc = []
+        new_features_rest = []
+        new_max_radii2D = []
+        new_tmp_radii = []
+        new_denom = []
+        new_xyz_gradient_accum = []
+        new_exposure = []
+
+        for cluster in clusters:
+            if len(cluster) == 1:
+                # If only one Gaussian, keep it unchanged
+                idx = cluster[0]
+                new_xyz.append(self._xyz[idx])
+                new_scaling.append(self._scaling[idx])
+                new_rotation.append(self._rotation[idx])
+                new_opacity.append(self._opacity[idx])
+                new_features_dc.append(self._features_dc[idx])
+                new_features_rest.append(self._features_rest[idx])
+                new_max_radii2D.append(self.max_radii2D[idx])
+                new_tmp_radii.append(self.tmp_radii[idx])
+                new_denom.append(self.denom[idx])
+                new_xyz_gradient_accum.append(self.xyz_gradient_accum[idx])
+                new_exposure.append(self._exposure[idx])
+            else:
+                # Merge Gaussians in the cluster
+                indices = torch.tensor(cluster, device=self.device)
+                merged_xyz = torch.mean(self._xyz[indices], dim=0)
+                merged_scaling = torch.mean(self._scaling[indices], dim=0)
+                merged_rotation = torch.mean(self._rotation[indices], dim=0)  # Simple average
+                merged_opacity = torch.mean(self._opacity[indices])  # Simple average
+
+                new_xyz.append(merged_xyz)
+                new_scaling.append(merged_scaling)
+                new_rotation.append(merged_rotation)
+                new_opacity.append(merged_opacity)
+                new_features_dc.append(self._features_dc[indices[0]])  # Use the first Gaussian's features
+                new_features_rest.append(self._features_rest[indices[0]])  # Use the first Gaussian's features
+                new_max_radii2D.append(self.max_radii2D[indices].max())
+                new_tmp_radii.append(self.tmp_radii[indices].max())
+                new_denom.append(self.denom[indices].sum())
+                new_xyz_gradient_accum.append(self.xyz_gradient_accum[indices].sum())
+                new_exposure.append(self._exposure[indices[0]])  # Use the first Gaussian's exposure
+                
+        new_opacity_fixed = [op.unsqueeze(0) if op.dim() == 0 else op for op in new_opacity]
+        new_xyz = torch.stack(new_xyz)
+        new_scaling = torch.stack(new_scaling)
+        new_rotation = torch.stack(new_rotation)
+        new_opacity_fixed = torch.stack(new_opacity_fixed)
+        new_features_dc = torch.stack(new_features_dc)
+        new_features_rest = torch.stack(new_features_rest)
+        new_max_radii2D = torch.tensor(new_max_radii2D, device=self.device)
+        new_tmp_radii = torch.tensor(new_tmp_radii, device=self.device)
+        new_denom = torch.tensor(new_denom, device=self.device)
+        new_xyz_gradient_accum = torch.tensor(new_xyz_gradient_accum, device=self.device)
+        new_exposure = torch.stack(new_exposure)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity_fixed, new_scaling, new_rotation, new_tmp_radii)
+        
+        print(f"Merged Gaussians. New count: {len(new_xyz)}")
+
+    # def find_merge_groups(self, gaussian_overlaps, nn_index,threshold):
+    #     num_stpr = gaussian_overlaps.shape[0]
+    #     uf = UnionFind(num_stpr)  # Union-Find to track connected components
+
+    #     # Iterate over each StPr and its neighbors
+    #     for i in range(num_stpr):
+    #         for j in range(gaussian_overlaps.shape[1]):  # Iterate over `num_neighbors`
+    #             if gaussian_overlaps[i, j] > threshold:
+    #                 neighbor_idx = nn_index[i, j]  # Get actual index from nn_index
+    #                 if neighbor_idx < num_stpr:  # Ensure within bounds
+    #                     uf.union(i, neighbor_idx)
+
+    #     # Collect clusters
+    #     clusters = {}
+    #     for i in range(num_stpr):
+    #         root = uf.find(i)
+    #         if root not in clusters:
+    #             clusters[root] = []
+    #         clusters[root].append(i)
+
+    #     return list(clusters.values())  # Return merged clusters
+    def find_merge_groups(self,gaussian_overlaps, threshold=0.5):
+        """
+        Find connected components in the Gaussian overlap graph.
+        
+        Args:
+            gaussian_overlaps (torch.Tensor): (N, N) overlap matrix.
+            threshold (float): Overlap threshold for merging.
+
+        Returns:
+            List[List[int]]: List of clusters, where each cluster is a list of indices.
+        """
+        N = gaussian_overlaps.shape[0]
+        adjacency_matrix = (gaussian_overlaps > threshold).float()
+        
+        # Union-Find to find connected components
+        parent = list(range(N))
+
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])  # Path compression
+            return parent[x]
+
+        def union(x, y):
+            root_x = find(x)
+            root_y = find(y)
+            if root_x != root_y:
+                parent[root_y] = root_x  # Merge groups
+
+        # Build the merge groups
+        for i in range(N):
+            for j in range(i + 1, N):  # Only upper triangle to avoid duplicates
+                if adjacency_matrix[i, j] > 0:
+                    union(i, j)
+
+        # Group Gaussians by connected components
+        clusters = {}
+        for i in range(N):
+            root = find(i)
+            if root not in clusters:
+                clusters[root] = []
+            clusters[root].append(i)
+
+        return list(clusters.values())
+
+
+class UnionFind:
+    def __init__(self, n):
+        self.parent = list(range(n))  # Each node starts as its own root
+        self.rank = [1] * n  # Track tree depth for optimization
+
+    def find(self, x):
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])  # Path compression
+        return self.parent[x]
+
+    def union(self, x, y):
+        rootX = self.find(x)
+        rootY = self.find(y)
+        if rootX != rootY:
+            if self.rank[rootX] > self.rank[rootY]:
+                self.parent[rootY] = rootX
+            elif self.rank[rootX] < self.rank[rootY]:
+                self.parent[rootX] = rootY
+            else:
+                self.parent[rootY] = rootX
+                self.rank[rootX] += 1

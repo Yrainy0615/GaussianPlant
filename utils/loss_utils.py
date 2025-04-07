@@ -89,3 +89,36 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 def fast_ssim(img1, img2):
     ssim_map = FusedSSIMMap.apply(C1, C2, img1, img2)
     return ssim_map.mean()
+
+
+def binding_loss(stprs, appgs, nn, method="euler"or"mahalanobis"):
+    assigned_stprs = stprs._xyz[nn]
+    if method=="euler":
+        return torch.abs(assigned_stprs - appgs._xyz.unsqueeze(1)).mean()
+    elif method=="mahalanobis":
+        # TODO implement
+        pass
+
+
+def align_loss(gs, neighbor_index):
+    """
+    align neighboring gaussians' orientation and scale
+    """
+    point_idx = neighbor_index[:,0]
+    neighbor_index = neighbor_index[:,1:]
+
+    quat_samples = gs.get_rotation[point_idx]
+    quat_neighbours = gs.get_rotation[neighbor_index]
+    # scale loss
+    scale_samples = gs.get_scaling[point_idx]
+    scale_neighbours = gs.get_scaling[neighbor_index]
+    scale_diff = (scale_samples[:,None] - scale_neighbours) + 1e-4
+    loss_scale = scale_diff.norm(dim=-1).mean()
+    
+    # orientation loss #TODO: fix bug
+    # try add norm 
+    quat_samples = torch.nn.functional.normalize(quat_samples,dim=-1)
+    quat_neighbours = torch.nn.functional.normalize(quat_neighbours,dim=-1)
+    quat_dot = torch.sum(quat_samples.unsqueeze(1) * quat_neighbours, dim=-1).abs()    
+    loss_ori = 1 - quat_dot.mean()
+    return loss_scale+loss_ori

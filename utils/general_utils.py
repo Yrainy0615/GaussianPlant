@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import trimesh
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -131,3 +132,36 @@ def safe_state(silent):
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
+
+
+def read_mesh_as_pointcloud(path, save_path):
+    """
+    Load a mesh, convert it to a point cloud, and save it.
+
+    Args:
+        path (str): Path to the input mesh file.
+        save_path (str): Path to save the output point cloud.
+    """
+    # Load the mesh
+    mesh = trimesh.load(path)
+
+    # Extract vertices as points
+    points = mesh.vertices  # (N, 3)
+
+    # Create a PointCloud object
+    pcd = trimesh.PointCloud(points)
+
+    # Set point colors to brown (RGBA values normalized)
+    pcd.colors = np.tile([128, 64, 32], (points.shape[0], 1))  # (N, 4) - Brown in RGBA (normalized)
+
+    # Set normals to up direction for all points
+    pcd.normals = np.tile([0, 0, 1], (points.shape[0], 1))  # (N, 3)
+
+    # Export the point cloud
+    pcd.export(save_path)
+
+    print(f"Point cloud saved at: {save_path}")
+
+if __name__ == "__main__":
+    read_mesh_as_pointcloud("data/branch/points3d.ply","data/branch/points3d.ply")
+    

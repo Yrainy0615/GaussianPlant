@@ -55,7 +55,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
-        self.eval = False
+        self.eval = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -88,6 +88,11 @@ class OptimizationParams(ParamGroup):
         self.exposure_lr_delay_mult = 0.0
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_mask = 0.2
+        self.lambda_align = 0.5
+        self.lambda_overlap = 1
+        self.lambda_freq = 0.2
+        self.lambda_opacity = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
@@ -97,8 +102,9 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
-        self.iter_build_stprs = 1000
-        self.iter_build_appgs = 2000
+        self.iter_build_stprs = 3000
+        self.iter_build_appgs = 32000
+        # self.max_stpr_num = 2000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
