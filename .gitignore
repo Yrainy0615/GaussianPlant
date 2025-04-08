@@ -9,4 +9,7 @@ screenshots
 data
 *.ply
 Depth-Anything-V2
+*.obj
+*.mtl
+
 
