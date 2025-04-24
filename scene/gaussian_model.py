@@ -633,6 +633,7 @@ class GaussianModel:
             """
             Build structural primitives (StPrs) from optimized Gaussians using 3D Gaussian clustering.
             Using segmented leaf&branch points information for initialize leaf stpr(disk) and branch stpr(cylinder).
+            test for soft label 1:leaf, 0:branch
             """
             label_leaf, label_branch, labels = fit_cylinder_ransac(xyz, save_ply=False)
             index = 0
@@ -656,7 +657,9 @@ class GaussianModel:
                     leaf_feature_dc.append(feature_dc_stpr)
                     leaf_feature_rest.append(feature_rest_stpr)
                     surf_rotations.append(rot_disk)
-                    stpr_label.append('leaf')
+                    # stpr_label.append('leaf')
+                    prior = torch.tensor(0.8, device=self.device)
+                    stpr_label.append(torch.logit(prior))
                     leaf_index.append(index)
                     index += 1
                     
@@ -680,7 +683,9 @@ class GaussianModel:
                     branch_points_all.append(branch_points)
                     branch_feature_dc.append(feature_dc_stpr)
                     branch_feature_rest.append(feature_rest_stpr)
-                    stpr_label.append('branch')
+                    prior = torch.tensor(0.2, device=self.device)
+                    stpr_label.append(torch.logit(prior))
+                    # stpr_label.append('branch')
                     branch_index.append(index)
                     index += 1
                     # build cylinder gs
@@ -711,6 +716,7 @@ class GaussianModel:
         stpr_rotations = torch.tensor(stpr_rotations, dtype=torch.float, device=self.device)
         stpr_features_dc = torch.tensor(np.array(stpr_features_dc), dtype=torch.float, device=self.device)
         stpr_features_rest = torch.tensor(np.array(stpr_features_rest), dtype=torch.float, device=self.device)
+        stpr_label = torch.stack(stpr_label, dim=0)
         # stpr_opacities = torch.tensor(stpr_opacities, dtype=torch.float, device=self.device)
         # check nan in stpr_scales, rTypeError: can't convert cuda:7 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.eplace nan with 0.1
         stpr_scales[torch.isnan(stpr_scales)] = 0.1
@@ -735,7 +741,7 @@ class GaussianModel:
         self.structure_gs.exposure_mapping = self.exposure_mapping
         self.structure_gs.pretrained_exposures = None
         self.structure_gs.surf_rotations = stpr_sur_rots
-        self.structure_gs.stpr_label = stpr_label
+        self.structure_gs.stpr_label = nn.Parameter(stpr_label.requires_grad_(True))
         exposure = self._exposure.detach()
         self.structure_gs._exposure = nn.Parameter(exposure.requires_grad_(True))
         print(f"Initialized {len(stpr_positions)} Structural Primitives (StPrs) from Gaussian clustering.")
@@ -770,7 +776,10 @@ class GaussianModel:
                 rotations.append(rot)
                 new_features_dc.append(feature_dc)
                 new_features_rest.append(feature_rest)
-                labels = ['branch'] * pos.shape[0]
+                # labels = ['branch'] * pos.shape[0]
+                parent_id = branch_label[i]
+                logit = torch.log(torch.tensor(0.2, device=self.device))
+                labels = [logit] * pos.shape[0]
                 app_label.extend(labels)
                 app_index = torch.tensor(branch_label[i]).unsqueeze(0).repeat(pos.shape[0], 1)
                 app_stpr_nn.extend(app_index)
@@ -1403,9 +1412,10 @@ class GaussianModel:
 
     def build_surface(self):
         """ Rebuild cylinder and disk meshes from the stprs """
-        leaf_mask   = torch.tensor([lbl == 'leaf'   for lbl in self.structure_gs.stpr_label],   device=self.device)
-        branch_mask = torch.tensor([lbl == 'branch' for lbl in self.structure_gs.stpr_label],   device=self.device)
-
+        # leaf_mask   = torch.tensor([lbl == 'leaf'   for lbl in self.structure_gs.stpr_label],   device=self.device)
+        # branch_mask = torch.tensor([lbl == 'branch' for lbl in self.structure_gs.stpr_label],   device=self.device)
+        leaf_mask = torch.sigmoid(self.structure_gs.stpr_label) >= 0.5
+        branch_mask = torch.sigmoid(self.structure_gs.stpr_label) < 0.5
         # (a) leaf
         global2local_leaf = torch.full((len(self.structure_gs.stpr_label),), -1, device=self.device, dtype=torch.long)
         global2local_leaf[leaf_mask] = torch.arange(leaf_mask.sum(), device=self.device)
@@ -1425,8 +1435,10 @@ class GaussianModel:
         cyl_param , cylinder_mesh= stpr_to_cylinder(branch_pos, branch_scale, branch_rot, save_flag=True)
         self.cylinder_mesh = cylinder_mesh
 
-        leaf_mask_app   = torch.tensor([lbl == 'leaf'   for lbl in self.appgs.app_label], device=self.device)
-        branch_mask_app = torch.tensor([lbl == 'branch' for lbl in self.appgs.app_label], device=self.device)
+        # leaf_mask_app   = torch.tensor([lbl == 'leaf'   for lbl in self.appgs.app_label], device=self.device)
+        # branch_mask_app = torch.tensor([lbl == 'branch' for lbl in self.appgs.app_label], device=self.device)
+        leaf_mask_app   = torch.sigmoid(self.appgs.app_label) >= 0.5
+        branch_mask_app = torch.sigmoid(self.appgs.app_label) < 0.5
 
         xyz_leaf   = self.appgs._xyz[leaf_mask_app]              # (M_leaf,3)
         xyz_branch = self.appgs._xyz[branch_mask_app]
