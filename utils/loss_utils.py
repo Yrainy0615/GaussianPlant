@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+from plyfile import PlyData, PlyElement
+import numpy as np
 try:
     from diff_gaussian_rasterization._C import fusedssim, fusedssim_backward
 except:
@@ -91,14 +93,6 @@ def fast_ssim(img1, img2):
     return ssim_map.mean()
 
 
-def binding_loss(stprs, appgs, nn, method="euler"or"mahalanobis"):
-    assigned_stprs = stprs._xyz[nn]
-    if method=="euler":
-        return torch.abs(assigned_stprs - appgs._xyz.unsqueeze(1)).mean()
-    elif method=="mahalanobis":
-        # TODO implement
-        pass
-
 
 def align_loss(gs, neighbor_index):
     """
@@ -122,3 +116,63 @@ def align_loss(gs, neighbor_index):
     quat_dot = torch.sum(quat_samples.unsqueeze(1) * quat_neighbours, dim=-1).abs()    
     loss_ori = 1 - quat_dot.mean()
     return loss_scale+loss_ori
+
+
+def mst_loss(top,bottom,stpr_roataions,mst_edges):
+    """
+    stpr_xyz: [N,3]
+    stpr_roataions: [N,4]
+    mst_edges: [E,2]
+    loss_gap: penalize the gap between stprs
+    """
+    N = top.shape[0]
+    points = torch.zeros((2*N,3), device=top.device)
+    points[0::2] = top
+    points[1::2] = bottom    
+    loss_mst = 0
+    mst_edges = torch.tensor(mst_edges).to(top.device)
+    
+    ext_mask   = (mst_edges//2)[:,0] != (mst_edges//2)[:,1]
+    edge_idx   = mst_edges[ext_mask] 
+    gap = points[edge_idx[:,0]] - points[edge_idx[:,1]]
+    # save paired points with the same color for test
+    loss_gap = gap.mean()
+    loss_mst += loss_gap
+    return loss_mst
+
+
+def save_paired_points(top, bottom, pairs,  # pairs = tensor([[i,j],...])
+                       ply_path='paired_pts.ply'):
+    """
+    top, bottom : (N,3)  torch.Tensor
+    pairs       : (K,2)  long  ->  (top_i , bottom_j)
+    """
+    K = pairs.size(0)
+    device = top.device
+    # ---------- 顶点坐标 ----------
+    v_top  = top[pairs[:,0]]
+    v_bot  = bottom[pairs[:,1]]
+    verts  = torch.cat([v_top, v_bot], 0).detach().cpu().numpy().astype('f4')  # (2K,3)
+
+    # ---------- 颜色（同对同色，随机） ----------
+    rgb = (np.random.rand(K,3)*255).astype('u1')
+    rgb = np.repeat(rgb, 2, axis=0)                                   # (2K,3)
+
+    # ---------- 1-D structured vertex array ----------
+    vertex = np.empty(2*K, dtype=[('x','f4'),('y','f4'),('z','f4'),
+                                  ('red','u1'),('green','u1'),('blue','u1')])
+    vertex['x'], vertex['y'], vertex['z'] = verts.T
+    vertex['red'], vertex['green'], vertex['blue'] = rgb.T
+    el_v = PlyElement.describe(vertex, 'vertex')
+
+    # ---------- edge element ----------
+    # 每对端点在 verts 中的索引： (2*i   , 2*i+1)
+    edge_idx = np.arange(2*K, dtype=np.uint32).reshape(-1,2)
+    edge = np.empty(K, dtype=[('vertex1','u4'),('vertex2','u4')])
+    edge['vertex1'] = edge_idx[:,0]
+    edge['vertex2'] = edge_idx[:,1]
+    el_e = PlyElement.describe(edge, 'edge')
+
+    # ---------- 写 PLY ----------
+    PlyData([el_v, el_e], text=True).write(ply_path)
+    print(f'Saved {ply_path}  (verts {2*K}, edges {K})')

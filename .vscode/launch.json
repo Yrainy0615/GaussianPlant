@@ -8,10 +8,14 @@
           "program": "${workspaceFolder}/train.py",
           "console": "integratedTerminal",
           "args": [
-              "-s", "data/plant4_blender",
-              "-m", "output/plant4_blender",
-              "--gpu", "7",
-              "--port", "6007"
+              "-s", "data/ficus",
+              "-m", "output/ficus_debug/test",
+              "--gpu", "1",
+              "--port", "6007",
+            //   "--reg_overlap",
+            //   "--reg_align",
+            //   "--reg_mst",
+              // "--start_checkpoint", "7000",
           ],
           "justMyCode": true
       }

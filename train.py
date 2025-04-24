@@ -40,12 +40,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians_init = GaussianModel(dataset.sh_degree, opt.optimizer_type, args.device)
     appgs = None
     stprs = None
+    process_state = "init"
     scene = Scene(dataset, gaussians_init)
     gaussians_init.training_setup(opt)
     gt_xyz = gaussians_init.get_xyz.detach()
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians_init.restore(model_params, opt)
+        appgs = gaussians_init.appgs
+        stprs = gaussians_init.stprs
+        process_state = 'appgs'
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -60,19 +64,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
-    process_state = "init"
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     # regularizer           
     loss_align = 0
-    loss_overlap = 0
+    loss_overlap = 0    
     loss_freq = 0
     num_appgs = 0
     num_stprs = 0
     loss_bind = 0
     loss_opacity_app = 0
     loss_opacity_stprs = 0
+    loss_mst = 0
     image_stprs = None
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -91,22 +95,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 network_gui.conn = None
 
         iter_start.record()
-        # build our representation
-        if os.path.exists(os.path.join(args.source_path, "points_3dgs.ply")):
-            opt.iter_build_stprs= 1
-        else:
-            opt.iter_build_stprs = 7001
-        if iteration == opt.iter_build_stprs:   # build stprs from inital gaussians
-            stprs = gaussians_init.build_stprs_from_gs(num_clusters=100, method='3dgs')
-            stprs.training_setup(opt)
-            stprs.save_ply(os.path.join(scene.model_path, "stprs_init.ply"))
-            process_state = "stprs"
-        if iteration == opt.iter_build_appgs :# build appgs from stprs
-            cylinder_paras = stprs.convert_gs_to_cylinders()
-            appgs = gaussians_init.build_appgs_from_cylinder(cylinder_paras,num_samples=50)
-            print('binding appgs to stprs')
-            appgs.training_setup(opt)
-            process_state = "appgs"
+        if stprs is None:
+            # build our representation
+            if os.path.exists(os.path.join(args.source_path, "points_3dgs.ply")):
+                opt.iter_build_stprs= 1
+                opt.iter_build_appgs = 1
+            else:
+                opt.iter_build_stprs = 7000
+                opt.iter_build_appgs = 7000
+            if iteration == opt.iter_build_stprs:   # build stprs from inital gaussians
+                gaussians_init.load_ply(os.path.join(args.source_path, "points_3dgs.ply"))
+                stprs,appgs = gaussians_init.build_stprs_from_gs(num_clusters=100, method='3dgs')
+                stprs.training_setup(opt)
+                appgs.training_setup(opt)
+                stprs.save_ply(os.path.join(scene.model_path, "stprs_init.ply"))
+                appgs.save_ply(os.path.join(scene.model_path, "appgs_init.ply"))
+                process_state = "appgs"
+            # gaussians_init.update_nn_between_appgs_and_stprs()
  
          # Pick a random Camera
         if not viewpoint_stack:
@@ -201,12 +206,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 image_stprs *= alpha_mask
             
             # Basic Loss
-            Ll1 = l1_loss(image_stprs, gt_image)
-            if FUSED_SSIM_AVAILABLE:
-                ssim_value = fused_ssim(image_stprs.unsqueeze(0), gt_image.unsqueeze(0))
-            else:
-                ssim_value = ssim(image_stprs, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            # Ll1 = l1_loss(image_stprs, gt_image)
+            # if FUSED_SSIM_AVAILABLE:
+            #     ssim_value = fused_ssim(image_stprs.unsqueeze(0), gt_image.unsqueeze(0))
+            # else:
+            #     ssim_value = ssim(image_stprs, gt_image)
+            # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            loss = 0
             # Depth regularization
             Ll1depth_pure = 0.0
             invDepth = None
@@ -243,6 +249,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if args.reg_freq:
                 loss_freq = stprs.low_freq_loss()
                 loss += loss_freq * opt.lambda_freq
+            # binding loss
+            
             loss.backward()
             
         elif process_state == "appgs":
@@ -260,67 +268,59 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 alpha_mask = viewpoint_cam.alpha_mask.to(args.device)
                 image *= alpha_mask
             # Basic Loss
-            # Ll1 = l1_loss(image, gt_image)
+            Ll1 = l1_loss(image, gt_image)
             if FUSED_SSIM_AVAILABLE:
                 ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
             else:
                 ssim_value = ssim(image, gt_image)
-            Ll1 = l1_loss(image_stprs, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-            # Depth regularization
+            Ll1_stpr = l1_loss(image_stprs, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + 0.5 * Ll1_stpr
+            # Depth regularization for stpr and appgs
             Ll1depth_pure = 0.0
-            invDepth = None
+            invDepth_appgs = None
+            invDepth_stprs = None
             mono_invdepth = None
             if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-                invDepth = render_pkg_stprs["depth"]
+                invDepth_stprs = render_pkg_stprs["depth"]
+                invDepth_appgs = render_pkg_appgs["depth"]
                 mono_invdepth = viewpoint_cam.invdepthmap.to(args.device)
                 depth_mask = viewpoint_cam.depth_mask.to(args.device)
 
-                Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-                Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+                Ll1depth_pure_appgs = torch.abs((invDepth_appgs  - mono_invdepth) * depth_mask).mean()
+                Ll1depth_pure_stprs = torch.abs((invDepth_stprs  - mono_invdepth) * depth_mask).mean()
+                Ll1depth = depth_l1_weight(iteration) * (Ll1depth_pure_appgs + Ll1depth_pure_stprs) / 2 
                 loss += Ll1depth * 0.001
                 Ll1depth = Ll1depth.item()
             else:
                 Ll1depth = 0
-            
-            # mask loss
-            loss_mask = 0
-            # if args.reg_mask:
-                # loss_mask_app = l1_loss(mask_appgs, gt_mask)
-                # loss += loss_mask_app * opt.lambda_mask
-                # loss_mask_stprs = l1_loss(mask_stprs, gt_mask)
-                # loss += loss_mask_stprs * opt.lambda_mask
 
             # regularizer           
 
-            if args.reg_align or args.reg_overlap:
+            if iteration >100:
                 # appgs.reset_neighbors()
                 stprs.reset_neighbors()
                 neighbor_idx  = stprs.get_neighbors_of_random_points(-1)
+                appgs.reset_neighbors()
+                neighbor_idx_app  = appgs.get_neighbors_of_random_points(-1)
                 # neighbor_idx_appg  = appgs.get_neighbors_of_random_points(stprs.get_xyz.shape[0]//10)
-            if args.reg_align:
-                # gaussian_align = stprs.compute_gaussian_alignment_with_neighbors(neighbor_idx)
-                # loss_align = (1-gaussian_align).mean()
-                loss_align = align_loss(stprs, neighbor_idx)
-                loss+= loss_align * opt.lambda_align
-            if args.reg_overlap:
-                gaussian_overlap = stprs.compute_gaussian_overlap_with_neighbors(neighbor_idx)
-                loss_overlap = gaussian_overlap.mean()
-                loss += loss_overlap * opt.lambda_overlap
-            if args.reg_opacity:
-                loss_opacity_app = appgs.opacity_regularizer()
-                loss_opacity_stprs = stprs.opacity_regularizer()
-                loss += loss_opacity_app * opt.lambda_opacity + loss_opacity_stprs * opt.lambda_opacity
+                if args.reg_align:
+                    loss_align = align_loss(appgs, neighbor_idx_app)
+                    loss+= loss_align * opt.lambda_align
+                if args.reg_overlap:
+                    gaussian_overlap = stprs.compute_gaussian_overlap_with_neighbors(neighbor_idx)
+                    loss_overlap = 1-gaussian_overlap.mean()
+                    loss += loss_overlap * opt.lambda_overlap
+                if args.reg_opacity:
+                    loss_opacity_app = appgs.opacity_regularizer()
+                    loss_opacity_stprs = stprs.opacity_regularizer()
+                    loss += loss_opacity_app * opt.lambda_opacity + loss_opacity_stprs * opt.lambda_opacity
+                if args.reg_mst:
+                    _,_,loss_mst = gaussians_init.stpr_to_graph()
+                    loss += loss_mst * opt.lambda_mst
                 
-            # binding loss
-            # nn = gaussians_init.get_nn_between_appgs_and_stprs() # (num_appgs, 1)
-            # cylinder_paras = stprs.convert_gs_to_cylinders()
-            # loss_bind = appgs.gs_cylinder_distance(nn, cylinder_paras)
-            cylinder_paras = stprs.convert_gs_to_cylinders()
-            appgs = gaussians_init.build_appgs_from_cylinder(cylinder_params=cylinder_paras, num_samples=100)
-            points = appgs.get_xyz
-            loss_bind = chamfer_distance(points.unsqueeze(0),gt_xyz.unsqueeze(0))[0]
+            loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface')
             loss += loss_bind * 0.1
+            loss += loss
             loss.backward()
 
         iter_end.record()
@@ -346,10 +346,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 num_appgs = appgs.get_xyz.shape[0]
             if stprs is not None:
                 num_stprs = stprs.get_xyz.shape[0]
-            training_report(tb_writer, iteration, Ll1, loss, Ll1depth_pure,loss_align, loss_overlap,l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, image,  invDepth,mono_invdepth, image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_app, loss_opacity_stprs, loss_bind)
+            training_report(tb_writer, iteration, Ll1, loss, Ll1depth_pure,loss_align, loss_overlap,l1_loss, testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, image,  invDepth_appgs,invDepth_stprs,mono_invdepth, image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_app, loss_opacity_stprs, loss_bind,loss_mst)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration,save_stpr=True)
+                scene.save(iteration,save_app=True,save_stpr=True,save_branch=True)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -380,47 +380,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
                 elif process_state == "appgs":
-                    # appgs.max_radii2D[visibility_filter] = torch.max(appgs.max_radii2D[visibility_filter], radii[visibility_filter])
-                    # appgs.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                    appgs.max_radii2D[visibility_filter] = torch.max(appgs.max_radii2D[visibility_filter], radii[visibility_filter])
+                    appgs.add_densification_stats(viewspace_point_tensor, visibility_filter)
                     stprs.max_radii2D[visibility_filter_stprs] = torch.max(stprs.max_radii2D[visibility_filter_stprs], radii_stprs[visibility_filter_stprs])
                     stprs.add_densification_stats(stprs._xyz, visibility_filter_stprs)
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                        # appgs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold,radii)
-                        # appgs.drop_low_opacity_points()
-                        # appgs.reset_opacity_stpr()
-                        size_threshold_large, size_threshold_small = 30, 5
-
+                        appgs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold,radii,flag='app')
+                   
+                        """ Adaptive densification control of stprs """
+                        grad_threshold_stpr = 0.0005
                         if stprs.get_xyz.shape[0] < args.max_stpr_num:
-                            stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii_stprs)
-                            # if stprs.get_xyz.shape[0] > opt.max_stpr_num//2:
-                            # stprs.drop_low_opacity_points()
-                            # stprs.reset_opacity_stpr()
-                            stprs.reset_neighbors()
-                            neighbor_idx = stprs.get_neighbors_of_random_points(-1)
-                            gaussian_overlap = stprs.compute_gaussian_overlap_with_neighbors(neighbor_idx)
-                            # stprs.merge_gaussians(gaussian_overlap, neighbor_idx)
-                            stprs.drop_low_opacity_points()
-                        else:
-                            stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent*10, size_threshold, radii_stprs,only_prune=True)
-                            neighbor_idx = stprs.get_neighbors_of_random_points(-1)
-                            gaussian_overlap = stprs.compute_gaussian_overlap_with_neighbors(neighbor_idx)
-                            # stprs.merge_gaussians(gaussian_overlap, neighbor_idx)
-                            stprs.drop_low_opacity_points() 
-                    # if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    #     stprs.drop_low_opacity_points()
-                    #     stprs.reset_opacity()
+                            size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                            stprs.densify_and_prune(grad_threshold_stpr, 0.005, scene.cameras_extent, size_threshold, radii_stprs,flag='stpr')
 
-            # if iteration >  opt.iter_build_appgs and iteration%opt.iter_rebind == 0:
-            #     #TODO merge stprs
-            #     cylinder_paras = stprs.convert_gs_to_cylinders()
-            #     appgs = gaussians_init
-            #     # densify stprs
-            #     stprs.max_radii2D[visibility_filter_stprs] = torch.max(stprs.max_radii2D[visibility_filter_stprs], radii_stprs[visibility_filter_stprs])
-            #     stprs.add_densification_stats(stprs._xyz, visibility_filter_stprs)
-            #     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-            #     stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii_stprs)
-            #     process_state = "stprs"
+                        else:
+                            stprs.densify_and_prune(grad_threshold_stpr, 0.005, scene.cameras_extent, size_threshold, radii_stprs, only_prune=True,flag='stpr')
+                        gaussians_init.update_nn_between_appgs_and_stprs()
                
             # Optimizer step
             if iteration < opt.iterations:
@@ -431,16 +407,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     stprs.optimizer.step()
                     stprs.optimizer.zero_grad(set_to_none = True)
                 if process_state == "appgs":
-                    # appgs.optimizer.step()
-                    # appgs.optimizer.zero_grad(set_to_none = True)
+                    appgs.optimizer.step()
+                    appgs.optimizer.zero_grad(set_to_none = True)
                     stprs.optimizer.step()
                     stprs.optimizer.zero_grad(set_to_none = True)
 
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                # torch.save((appgs.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + "_appgs.pth")
+                torch.save((appgs.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + "_appgs.pth")
                 torch.save((stprs.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + "_stprs.pth")
+                # torch.save((gaussians_init.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):   
     if not args.model_path:
@@ -464,7 +441,9 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, loss_depth,loss_align,loss_overlap,l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, image, depth,mono_invdepth,image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_appgs, loss_opacity_stprs, loss_bind):
+def training_report(tb_writer, iteration, Ll1, loss, loss_depth,loss_align,loss_overlap,l1_loss, testing_iterations, 
+                    scene : Scene, renderFunc, renderArgs, train_test_exp, image, depth_appgs, depth_stprs
+,mono_invdepth,image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_appgs, loss_opacity_stprs, loss_bind,loss_mst):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -477,11 +456,14 @@ def training_report(tb_writer, iteration, Ll1, loss, loss_depth,loss_align,loss_
         tb_writer.add_scalar('train_loss_patches/opacity_loss_appgs', loss_opacity_appgs, iteration)
         tb_writer.add_scalar('train_loss_patches/opacity_loss_stprs', loss_opacity_stprs, iteration)
         tb_writer.add_scalar('train_loss_patches/binding_loss', loss_bind, iteration)
+        tb_writer.add_scalar('train_loss_patches/mst_loss', loss_mst, iteration)
         
         # add image 
         tb_writer.add_images('train_image_patches/render', image[None], global_step=iteration)
-        if depth is not None:
-            tb_writer.add_images('train_image_patches/depth', depth[None], global_step=iteration)
+        if depth_stprs is not None:
+            tb_writer.add_images('train_image_patches/depth_stprs', depth_stprs[None], global_step=iteration)
+        if depth_appgs is not None:
+            tb_writer.add_images('train_image_patches/depth_appgs', depth_appgs[None], global_step=iteration)
         if mono_invdepth is not None:
             tb_writer.add_images('train_image_patches/mono_invdepth', mono_invdepth[None], global_step=iteration)
         if image_stprs is not None:
@@ -532,7 +514,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000,7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000,7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[300,1000,2000,3000,5000,7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3000,7000,15000,30000])
@@ -543,7 +525,8 @@ if __name__ == "__main__":
     parser.add_argument("--reg_overlap", action="store_true", default=False)
     parser.add_argument("--reg_freq", action="store_true", default=False)
     parser.add_argument("--reg_opacity", action="store_true", default=False)
-    parser.add_argument("--max_stpr_num", type=int, default=50000 )
+    parser.add_argument("--reg_mst", action="store_true", default=False)
+    parser.add_argument("--max_stpr_num", type=int, default=2000 )
 
     
     args = parser.parse_args(sys.argv[1:])

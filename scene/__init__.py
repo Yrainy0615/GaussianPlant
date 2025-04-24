@@ -17,6 +17,8 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+import open3d as o3d
+from utils.gs_utils import save_mst_ply
 
 class Scene:
 
@@ -83,13 +85,24 @@ class Scene:
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
-    def save(self, iteration,save_gs=False,save_stpr=False):
+    def save(self, iteration,save_gs=False,save_stpr=False,save_app=False,save_branch=False,save_mst=True):
         if save_gs:
             point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
             self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         if save_stpr and self.gaussians.structure_gs is not None:
             point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
             self.gaussians.structure_gs.save_ply(os.path.join(point_cloud_path, "stprs.ply"))
+        if save_app and self.gaussians.appgs is not None:
+            point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+            self.gaussians.appgs.save_ply(os.path.join(point_cloud_path, "apps.ply"))
+        if save_branch:
+            branch = self.gaussians.cylinder_mesh
+            branch_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+            o3d.io.write_triangle_mesh(os.path.join(branch_path, "branch.ply"), branch)
+        if save_mst:
+            mst_edges, points,_ = self.gaussians.stpr_to_graph()
+            save_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+            save_mst_ply(points, mst_edges, os.path.join(save_path, "mst.ply"))
         exposure_dict = {
             image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
             for image_name in self.gaussians.exposure_mapping

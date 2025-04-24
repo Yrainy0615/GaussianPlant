@@ -24,14 +24,15 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scipy.spatial.transform import Rotation as R
 from sklearn.cluster import KMeans
 import faiss
-from pytorch3d.transforms import quaternion_to_matrix, quaternion_invert, quaternion_apply
+from pytorch3d.transforms import quaternion_to_matrix, quaternion_invert, quaternion_apply, matrix_to_quaternion
 from pytorch3d.ops import knn_points, estimate_pointcloud_normals
 import networkx as nx
 from scipy.spatial import cKDTree
 from plyfile import PlyData, PlyElement
 import trimesh
-from utils.gs_utils import fit_cylinder_ransac, estimate_gs_para_from_cluster, branch_to_cylinder
+from utils.gs_utils import fit_cylinder_ransac, estimate_gs_para_from_cluster, branch_to_cylinder, leaf_to_disk, stpr_to_cylinder, gs_to_disk_distance, gs_to_cylinder_distance, stpr_to_disk, build_edge, build_mst_from_endpoints,save_mst_ply
 import time
+from utils.loss_utils import mst_loss
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -81,9 +82,13 @@ class GaussianModel:
         self.knn_dists = None
         self.knn_idx = None
         self.n_points = None
-        self.nn_stpr_app = None
+        self.nn_stpr_appgs = None
         self.structure_gs = None
         self.appgs = None
+        self.leaf_disks = None
+        self.branch_cylinders = None
+        self.stpr_label = None 
+        self.app_label = None
         
     def capture(self):
         return (
@@ -100,7 +105,9 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
-            self.n_points
+            self.n_points,
+            # self.appgs,
+            # self.structure_gs,
         )
     
     def restore(self, model_args, training_args):
@@ -191,8 +198,6 @@ class GaussianModel:
             cov_full[:, 2, 0] = cov[:, 2]
             cov_full[:, 2, 1] = cov[:, 4]
             return cov_full
-
-
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -406,7 +411,7 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    def prune_points(self, mask):
+    def prune_points(self, mask,flag=Literal['app','stpr']):
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -420,6 +425,12 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
+        if flag=='app':
+            self.app_label = [lbl for lbl, m in zip(self.app_label, valid_points_mask) if m]
+            assert len(self.app_label) == self.get_xyz.shape[0]
+        elif flag=='stpr':
+            self.stpr_label = [lbl for lbl, m in zip(self.stpr_label, valid_points_mask) if m]
+            assert len(self.stpr_label) == self.get_xyz.shape[0]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
@@ -445,7 +456,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_label,flag):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -462,11 +473,18 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
+        if flag=='app':
+            self.app_label.extend(new_label)
+            assert len(self.app_label) == self.get_xyz.shape[0]
+        elif flag=='stpr':
+            self.stpr_label.extend(new_label)
+            assert len(self.stpr_label) == self.get_xyz.shape[0]
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
+        
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, flag=Literal['app','stpr'],N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device=self.device)
@@ -486,13 +504,19 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        if flag == 'app':
+            new_label = [lbl for lbl, m in zip(self.app_label, selected_pts_mask) if m]
+            new_label = new_label * N
+        elif flag == 'stpr':
+            new_label = [lbl for lbl, m in zip(self.stpr_label, selected_pts_mask) if m]
+            new_label = new_label * N
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii,new_label,flag)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device=self.device, dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent,flag=Literal['app', 'stpr']):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -506,17 +530,21 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        if flag == 'app':
+            new_label = [lbl for lbl, m in zip(self.app_label, selected_pts_mask) if m]
+        elif flag == 'stpr':
+            new_label = [lbl for lbl, m in zip(self.stpr_label, selected_pts_mask) if m]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,new_label,flag)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, only_prune=False,size_threshold_small=None):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, flag=Literal['app','stprs'],only_prune=False,size_threshold_small=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
         if not only_prune:
-            self.densify_and_clone(grads, max_grad, extent)
-            self.densify_and_split(grads, max_grad, extent)
+            self.densify_and_clone(grads, max_grad, extent,flag)
+            self.densify_and_split(grads, max_grad, extent,flag)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         prune_low_opacity_count = prune_mask.sum()
@@ -531,8 +559,8 @@ class GaussianModel:
             small_points_ws = self.get_scaling.max(dim=1).values < 0.05 * extent
             prune_mask = torch.logical_or(prune_mask, small_points_ws)
             prune_small_count = small_points_ws.sum()
-        self.prune_points(prune_mask)
-        # print(f"Pruned {prune_low_opacity_count} points with low opacity, {prune_large_count} points with large screen size, {prune_small_count} points with small screen size.")
+        self.prune_points(prune_mask,flag=flag)
+        print(f"Pruned {prune_low_opacity_count} points with low opacity, {prune_large_count} points with large screen size, {prune_small_count} points with small screen size.")
 
 
         torch.cuda.empty_cache()
@@ -559,10 +587,25 @@ class GaussianModel:
         stpr_positions = []
         stpr_scales = []
         stpr_rotations = []
+        stpr_features_dc = []
+        stpr_features_rest = []
         branch_positions = []
         branch_scales = []
         branch_rotations = []
         branch_points_all = []
+        leaf_positions = []
+        leaf_scales = []
+        leaf_rotations = []
+        branch_quat = []
+        leaf_quat = []
+        branch_feature_dc = []
+        branch_feature_rest = []
+        leaf_feature_dc = []
+        leaf_feature_rest = []
+        stpr_label = []
+        branch_index = []
+        leaf_index = []
+        surf_rotations = []
         if method == 'kmeans':
             # Flatten covariance matrices for clustering
             covariances_flat = covariance.reshape(covariance.shape[0], -1)
@@ -591,120 +634,192 @@ class GaussianModel:
             Build structural primitives (StPrs) from optimized Gaussians using 3D Gaussian clustering.
             Using segmented leaf&branch points information for initialize leaf stpr(disk) and branch stpr(cylinder).
             """
-            label_leaf, label_branch, labels = fit_cylinder_ransac(xyz, save_ply=True)
-            for label in np.unique(labels):
+            label_leaf, label_branch, labels = fit_cylinder_ransac(xyz, save_ply=False)
+            index = 0
+            for i,label in enumerate(np.unique(labels)):
                 if label in label_leaf:
                     # build disk gs
                     leaf_points = xyz[labels == label]
-                    mean,stpr_rot, stpr_scale = estimate_gs_para_from_cluster(leaf_points,test_flag=True)
+                    mean,stpr_rot, stpr_scale,rot_cylinder,rot_disk = estimate_gs_para_from_cluster(leaf_points,test_flag=False)
                     stpr_scale[2] = 1e-6
                     stpr_positions.append(mean)
                     stpr_scales.append(stpr_scale)
                     stpr_rotations.append(stpr_rot)
+                    feature_dc_stpr = feature_dc[labels == label].mean(axis=0)
+                    feature_rest_stpr = feature_rest[labels == label].mean(axis=0)
+                    stpr_features_dc.append(feature_dc_stpr)
+                    stpr_features_rest.append(feature_rest_stpr)
+                    leaf_positions.append(mean)
+                    leaf_scales.append(stpr_scale)
+                    leaf_quat.append(stpr_rot)
+                    leaf_rotations.append(rot_disk)
+                    leaf_feature_dc.append(feature_dc_stpr)
+                    leaf_feature_rest.append(feature_rest_stpr)
+                    surf_rotations.append(rot_disk)
+                    stpr_label.append('leaf')
+                    leaf_index.append(index)
+                    index += 1
                     
                 elif label in label_branch:
                     # build 3dgs
                     branch_points = xyz[labels == label]
-                    mean,stpr_rot, stpr_scale = estimate_gs_para_from_cluster(branch_points,test_flag=True)
+                    mean,stpr_rot, stpr_scale,rot_cylinder,rot_disk = estimate_gs_para_from_cluster(branch_points,test_flag=False)
                     stpr_scales.append(stpr_scale)
                     stpr_rotations.append(stpr_rot)
                     stpr_positions.append(mean)
+                    feature_dc_stpr = feature_dc[labels == label].mean(axis=0)
+                    feature_rest_stpr = feature_rest[labels == label].mean(axis=0)
+                    stpr_features_dc.append(feature_dc_stpr)
+                    stpr_features_rest.append(feature_rest_stpr)
                     # record branch stprs for later use
                     branch_positions.append(mean)
                     branch_scales.append(stpr_scale)
-                    branch_rotations.append(stpr_rot)
+                    branch_rotations.append(rot_cylinder)
+                    surf_rotations.append(rot_cylinder)
+                    branch_quat.append(stpr_rot)
                     branch_points_all.append(branch_points)
+                    branch_feature_dc.append(feature_dc_stpr)
+                    branch_feature_rest.append(feature_rest_stpr)
+                    stpr_label.append('branch')
+                    branch_index.append(index)
+                    index += 1
                     # build cylinder gs
-            branch_to_cylinder( branch_points=np.vstack(branch_points_all),branch_positions=branch_positions,
-                               branch_scales=branch_scales, branch_rotations=branch_rotations)
-                    
-                    
+            mesh_cylinder = branch_to_cylinder( branch_points=np.vstack(branch_points_all),branch_positions=branch_positions,
+                               branch_scales=branch_scales, branch_rotations=branch_rotations) # list of open3d mesh
+            leaf_disk = leaf_to_disk(leaf_positions=leaf_positions, leaf_scales=leaf_scales, leaf_rotations=leaf_rotations,save_flag=False) # list of open3d mesh
+            
+            self.appgs = self.build_appgs_from_stprs(mesh_cylinder,branch_scales,branch_quat, branch_feature_dc,branch_feature_rest,
+                                                     leaf_disk,leaf_scales, leaf_quat, leaf_feature_dc, leaf_feature_rest,
+                                                     branch_label=branch_index, leaf_label=leaf_index,
+                                                     samples_per_branch=10, samples_per_leaf=10,
+                                                     )
+            self.leaf_disks = leaf_disk
+            self.branch_cylinders = mesh_cylinder
+            self.branch_label = branch_index
+            self.leaf_label = leaf_index
+            
+            
 
         
         else:
             raise ValueError("Unknown clustering method. Use 'pca' or 'random'.")
 
         # Convert lists to tensors
-        rot_torch3d = np.roll(np.array(stpr_rotations), 1, axis=1)
+        # stpr_rotations = np.roll(np.array(stpr_rotations), 1, axis=1)
         stpr_positions = torch.tensor(np.array(stpr_positions), dtype=torch.float, device=self.device)
         stpr_scales = torch.tensor(np.array(stpr_scales), dtype=torch.float, device=self.device)
-        stpr_rotations = torch.tensor(rot_torch3d, dtype=torch.float, device=self.device)
-        # check nan in stpr_scales, replace nan with 0.1
+        stpr_rotations = torch.tensor(stpr_rotations, dtype=torch.float, device=self.device)
+        stpr_features_dc = torch.tensor(np.array(stpr_features_dc), dtype=torch.float, device=self.device)
+        stpr_features_rest = torch.tensor(np.array(stpr_features_rest), dtype=torch.float, device=self.device)
+        # stpr_opacities = torch.tensor(stpr_opacities, dtype=torch.float, device=self.device)
+        # check nan in stpr_scales, rTypeError: can't convert cuda:7 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.eplace nan with 0.1
         stpr_scales[torch.isnan(stpr_scales)] = 0.1
-        
+        stpr_sur_rots = torch.tensor(np.array(surf_rotations), dtype=torch.float, device=self.device)
         # scale filter for the stpr to remove background large gs
         scale_filter = stpr_scales.max(dim=1).values< 1
         stpr_positions = stpr_positions[scale_filter]
         stpr_scales = stpr_scales[scale_filter]
         stpr_scales = torch.log(stpr_scales)
         stpr_rotations = stpr_rotations[scale_filter]
-        stpr_opacities = self.inverse_opacity_activation( 0.1* torch.ones((stpr_positions.shape[0], 1),device=self.device))
+        stpr_opacities = self.inverse_opacity_activation( 0.5* torch.ones((stpr_positions.shape[0], 1),device=self.device))
         # Initialize a new GaussianModel for StPrs and return it
         self.structure_gs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type, device=self.device)
         self.structure_gs._xyz = nn.Parameter(stpr_positions.requires_grad_(True))
         self.structure_gs._scaling = nn.Parameter(stpr_scales.requires_grad_(True))
         self.structure_gs._rotation = nn.Parameter(stpr_rotations.requires_grad_(True))
-        self.structure_gs._features_dc = nn.Parameter(torch.ones((stpr_positions.shape[0], 1, 3), device=self.device).requires_grad_(True))
-        self.structure_gs._features_rest = nn.Parameter(torch.ones((stpr_positions.shape[0], 15, 3), device=self.device).requires_grad_(True))
-        self.structure_gs._opacity = nn.Parameter(stpr_opacities).requires_grad_(True)
+        self.structure_gs._features_dc = nn.Parameter(stpr_features_dc.requires_grad_(True))
+        self.structure_gs._features_rest = nn.Parameter(stpr_features_rest.requires_grad_(True))
+        self.structure_gs._opacity = nn.Parameter(stpr_opacities.requires_grad_(True))
         self.structure_gs.max_radii2D = torch.zeros((stpr_positions.shape[0]), device=self.device)
         self.structure_gs._mask = torch.ones((stpr_positions.shape[0],), dtype=torch.float, device=self.device)
         self.structure_gs.exposure_mapping = self.exposure_mapping
         self.structure_gs.pretrained_exposures = None
+        self.structure_gs.surf_rotations = stpr_sur_rots
+        self.structure_gs.stpr_label = stpr_label
         exposure = self._exposure.detach()
         self.structure_gs._exposure = nn.Parameter(exposure.requires_grad_(True))
-
         print(f"Initialized {len(stpr_positions)} Structural Primitives (StPrs) from Gaussian clustering.")
-        return self.structure_gs
+        return self.structure_gs,self.appgs
 
     
-    def build_appgs_from_stprs(self, samples_per_stgs=10):
-        if self.structure_gs is not None:
-            points_st = self.structure_gs._xyz
-            quaternions_st = self.structure_gs._rotation
-            scaling_st = self.structure_gs._scaling
-            gaussian_samples = points_st.unsqueeze(1) + quaternion_apply(
-                quaternions_st.unsqueeze(1), 
-                scaling_st.unsqueeze(1) * torch.randn(
-                    points_st.shape[0], samples_per_stgs, 3, device=self.device))
-        
-            # init gaussian parameters 
-            new_means = gaussian_samples.reshape(-1,3)
-            scales = scaling_st.unsqueeze(1).repeat(1, samples_per_stgs, 1) / samples_per_stgs
-            scales[:, :,-1] = 1e-6
-            scales= scales.reshape(-1,3)
-            # scales = torch.log(scales)
-            rots = quaternions_st.unsqueeze(1).repeat(1, samples_per_stgs, 1)
-            rots = rots.reshape(-1,4)
-            # init features
-            features_dc = self.structure_gs._features_dc.unsqueeze(1).repeat(1, samples_per_stgs, 1, 1).reshape(-1,1,3)
-            # assign features to each gaussian from the same structure
-            features_rest = self.structure_gs._features_rest.unsqueeze(1).repeat(1, samples_per_stgs, 1, 1).reshape(-1,15,3)
-            # init opacity
-            # new_opacities = self.structure_gs._opacity.unsqueeze(1).repeat(1, samples_per_stgs, 1).reshape(-1,1)    
-            new_opacities = self.inverse_opacity_activation(0.1 * torch.ones((new_means.shape[0], 1), dtype=torch.float, device=self.device))
-            # Set Gaussian parameters
-            self.appgs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type,device=self.device)
-            self.appgs._xyz = nn.Parameter(new_means.requires_grad_(True))
-            self.appgs._scaling = nn.Parameter(scales.requires_grad_(True))
-            self.appgs._rotation = nn.Parameter(rots.requires_grad_(True))
-            self.appgs._features_dc = nn.Parameter(features_dc.requires_grad_(True))
-            self.appgs._features_rest = nn.Parameter(features_rest.requires_grad_(True))
-            self.appgs._opacity = nn.Parameter(new_opacities.requires_grad_(True))
-            self.appgs.max_radii2D = torch.zeros((new_means.shape[0]), device=self.device)
-            self.appgs._mask = torch.ones((new_means.shape[0],), dtype=torch.float, device=self.device)
-            self.appgs.exposure_mapping = self.exposure_mapping
-            self.appgs.pretrained_exposures = None
-            self.appgs.nn_stpr_app
-            exposure = self._exposure.detach()
-            self.appgs._exposure = nn.Parameter(exposure.requires_grad_(True))
-            print(f"Initialized {new_means.shape[0]} Appearance Gaussians (AppGs) from Structural Primitives (StPrs).")
-            return self.appgs
+    def build_appgs_from_stprs(self, mesh_cylinder,branch_scales,branch_rotations, branch_feature_dc, branch_feature_rest,
+                               leaf_disk,leaf_scales, leaf_rotations,leaf_feature_dc, leaf_feature_rest,
+                               branch_label, leaf_label,
+                               samples_per_branch=10, samples_per_leaf=10):
+        """
+        Build Appearance Gaussians (AppGs) from the structural primitives (StPrs).
+        """
+        positions = []
+        scales= [] 
+        rotations = []
+        new_features_dc = []
+        new_features_rest = []
+        app_label = []
+        app_stpr_nn = []
+        if mesh_cylinder is not None:
+            for i,cylinder in enumerate(mesh_cylinder):
+                branch_pcd = cylinder.sample_points_uniformly(samples_per_branch)
+                pos = torch.tensor(np.asarray(branch_pcd.points)).float()
+                scale = torch.tensor((branch_scales[i]/samples_per_branch)).unsqueeze(0).repeat(pos.shape[0], 1)
+                # rot_quat = matrix_to_quaternion(branch_rotations[i])
+                rot = torch.tensor(branch_rotations[i]).unsqueeze(0).repeat(pos.shape[0], 1)
+                feature_dc = torch.tensor(branch_feature_dc[i]).repeat(pos.shape[0], 1)
+                feature_rest = torch.tensor(branch_feature_rest[i]).repeat(pos.shape[0], 1)
+                positions.append(pos)
+                scales.append(scale)
+                rotations.append(rot)
+                new_features_dc.append(feature_dc)
+                new_features_rest.append(feature_rest)
+                labels = ['branch'] * pos.shape[0]
+                app_label.extend(labels)
+                app_index = torch.tensor(branch_label[i]).unsqueeze(0).repeat(pos.shape[0], 1)
+                app_stpr_nn.extend(app_index)
 
 
+        if leaf_disk is not None:
+            for i,disk in enumerate(leaf_disk):
+                leaf_pcd = disk.sample_points_uniformly(samples_per_leaf)
+                pos = torch.tensor(np.asarray(leaf_pcd.points)).float()
+                scale = torch.tensor(leaf_scales[i]/samples_per_leaf).unsqueeze(0).repeat(pos.shape[0], 1)
+                scale[:,2] = 1e-6
+                # rot_quat = matrix_to_quaternion(leaf_rotations[i])
+                rot = torch.tensor(leaf_rotations[i]).unsqueeze(0).repeat(pos.shape[0], 1)
+                feature_dc = torch.tensor(leaf_feature_dc[i]).repeat(pos.shape[0], 1)
+                feature_rest = torch.tensor(leaf_feature_rest[i]).repeat(pos.shape[0], 1)
+                positions.append(pos)
+                scales.append(scale)
+                rotations.append(rot)
+                new_features_dc.append(feature_dc)
+                new_features_rest.append(feature_rest)
+                labels = ['leaf']*pos.shape[0]
+                app_label.extend(labels)
+                app_index = torch.tensor(leaf_label[i]).unsqueeze(0).repeat(pos.shape[0], 1)
+                app_stpr_nn.extend(app_index)
 
-        else: 
-                print("No structure to bind to")
+
+        num_total_samples = torch.vstack(positions).shape[0]
+        new_opacities = self.inverse_opacity_activation(0.5* torch.ones((num_total_samples, 1),device=self.device))
+        appgs_features_dc = torch.tensor(np.array(new_features_dc), dtype=torch.float, device=self.device)
+        appgs_features_rest = torch.tensor(np.array(new_features_rest), dtype=torch.float, device=self.device)  
+        appgs_features_dc = appgs_features_dc.reshape(-1, 1, 3)
+        appgs_features_rest = appgs_features_rest.reshape(-1,15,3)
+        self.appgs = GaussianModel(sh_degree=self.max_sh_degree, optimizer_type=self.optimizer_type, device=self.device)
+        self.appgs._xyz = nn.Parameter(torch.vstack(positions).to(self.device).requires_grad_(True))
+        self.appgs._scaling = nn.Parameter(torch.log(torch.vstack((scales))).float().to(self.device).requires_grad_(True))
+        self.appgs._rotation = nn.Parameter(torch.vstack(rotations).float().to(self.device).requires_grad_(True))
+        self.appgs._features_dc = nn.Parameter(appgs_features_dc.requires_grad_(True))
+        self.appgs._features_rest = nn.Parameter(appgs_features_rest.requires_grad_(True))
+        self.appgs._opacity = nn.Parameter(new_opacities.requires_grad_(True))
+        self.appgs.max_radii2D = torch.zeros((num_total_samples), device=self.device)
+        self.appgs._mask = torch.ones((num_total_samples), dtype=torch.float, device=self.device)
+        self.appgs.exposure_mapping = self.exposure_mapping
+        self.appgs.pretrained_exposures = None
+        self.appgs.app_label = app_label
+        self.nn_stpr_appgs = app_stpr_nn
+        exposure = self._exposure.detach()
+        self.appgs._exposure = nn.Parameter(exposure.requires_grad_(True))
+        print(f"Initialized {num_total_samples} Appearance Gaussians (AppGs) from StPrs.")
+        return self.appgs
 
     def build_appgs_from_cylinder(self, cylinder_params, num_samples=50):
         """
@@ -995,11 +1110,11 @@ class GaussianModel:
             self.knn_dists = knns.dists[0]
             self.knn_idx = knns.idx[0]
 
-    def get_nn_between_appgs_and_stprs(self):
+    def update_nn_between_appgs_and_stprs(self):
         app_points = self.appgs._xyz
         stpr_points = self.structure_gs._xyz
         knns = knn_points(app_points[None], stpr_points[None], K=1)
-        return knns.idx[0]
+        self.nn_stpr_appgs = knns.idx[0]
     
     def get_edge_neighbors(self, k_neighbors, 
                            edges=None, triangle_vertices=None,):
@@ -1082,8 +1197,7 @@ class GaussianModel:
         mask = self.get_opacity[...,0] < opacity_threshold  # 1e-3, 0.5
         self.prune_points(mask)
         print(f"Dropped {mask.sum()} points with opacity below {opacity_threshold}.")
-        print(f"""Remaining points: {len(self._xyz)}""")
-    
+        print(f"""Remaining points: {len(self._xyz)}""")  
     
     def convert_gs_to_cylinders(self, sigma=3.0):
         cov = self.get_covariance(return_full=True)
@@ -1142,7 +1256,6 @@ class GaussianModel:
         PlyData([vertex_element, edge_element], text=True).write(filename)
         print(f"PLY file saved as {filename}")
         
-
     def gs_cylinder_distance(self, nn_index, cylinder_params):
         # Extract Gaussian parameters
         C = cylinder_params["center"][nn_index].squeeze(1)  # (M, 3) Nearest cylinder centers
@@ -1169,7 +1282,7 @@ class GaussianModel:
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
         freq = 1.0 / torch.sqrt(eigenvalues+ 1e-6)
         return freq.mean() 
-    # 443889037454
+
     def merge_gaussians(self, gaussian_overlaps, nn_index,threshold=0.5):
         """
         Merge Gaussians in a GaussianModel based on overlap.
@@ -1244,27 +1357,6 @@ class GaussianModel:
         
         print(f"Merged Gaussians. New count: {len(new_xyz)}")
 
-    # def find_merge_groups(self, gaussian_overlaps, nn_index,threshold):
-    #     num_stpr = gaussian_overlaps.shape[0]
-    #     uf = UnionFind(num_stpr)  # Union-Find to track connected components
-
-    #     # Iterate over each StPr and its neighbors
-    #     for i in range(num_stpr):
-    #         for j in range(gaussian_overlaps.shape[1]):  # Iterate over `num_neighbors`
-    #             if gaussian_overlaps[i, j] > threshold:
-    #                 neighbor_idx = nn_index[i, j]  # Get actual index from nn_index
-    #                 if neighbor_idx < num_stpr:  # Ensure within bounds
-    #                     uf.union(i, neighbor_idx)
-
-    #     # Collect clusters
-    #     clusters = {}
-    #     for i in range(num_stpr):
-    #         root = uf.find(i)
-    #         if root not in clusters:
-    #             clusters[root] = []
-    #         clusters[root].append(i)
-
-    #     return list(clusters.values())  # Return merged clusters
     def find_merge_groups(self,gaussian_overlaps, threshold=0.5):
         """
         Find connected components in the Gaussian overlap graph.
@@ -1309,25 +1401,146 @@ class GaussianModel:
 
         return list(clusters.values())
 
+    def build_surface(self):
+        """ Rebuild cylinder and disk meshes from the stprs """
+        leaf_mask   = torch.tensor([lbl == 'leaf'   for lbl in self.structure_gs.stpr_label],   device=self.device)
+        branch_mask = torch.tensor([lbl == 'branch' for lbl in self.structure_gs.stpr_label],   device=self.device)
 
-class UnionFind:
-    def __init__(self, n):
-        self.parent = list(range(n))  # Each node starts as its own root
-        self.rank = [1] * n  # Track tree depth for optimization
+        # (a) leaf
+        global2local_leaf = torch.full((len(self.structure_gs.stpr_label),), -1, device=self.device, dtype=torch.long)
+        global2local_leaf[leaf_mask] = torch.arange(leaf_mask.sum(), device=self.device)
 
-    def find(self, x):
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])  # Path compression
-        return self.parent[x]
+        # (b) branch
+        global2local_branch = torch.full((len(self.structure_gs.stpr_label),), -1, device=self.device, dtype=torch.long)
+        global2local_branch[branch_mask] = torch.arange(branch_mask.sum(), device=self.device)
 
-    def union(self, x, y):
-        rootX = self.find(x)
-        rootY = self.find(y)
-        if rootX != rootY:
-            if self.rank[rootX] > self.rank[rootY]:
-                self.parent[rootY] = rootX
-            elif self.rank[rootX] < self.rank[rootY]:
-                self.parent[rootX] = rootY
+        leaf_pos   = self.structure_gs.get_xyz[leaf_mask]
+        leaf_scale = self.structure_gs.get_scaling[leaf_mask]
+        leaf_rot   = self.structure_gs.get_rotation[leaf_mask]
+        disk_param = stpr_to_disk(leaf_pos, leaf_scale, leaf_rot, save_flag=False)
+
+        branch_pos   = self.structure_gs.get_xyz[branch_mask]
+        branch_scale = self.structure_gs.get_scaling[branch_mask]
+        branch_rot   = self.structure_gs.get_rotation[branch_mask]
+        cyl_param , cylinder_mesh= stpr_to_cylinder(branch_pos, branch_scale, branch_rot, save_flag=True)
+        self.cylinder_mesh = cylinder_mesh
+
+        leaf_mask_app   = torch.tensor([lbl == 'leaf'   for lbl in self.appgs.app_label], device=self.device)
+        branch_mask_app = torch.tensor([lbl == 'branch' for lbl in self.appgs.app_label], device=self.device)
+
+        xyz_leaf   = self.appgs._xyz[leaf_mask_app]              # (M_leaf,3)
+        xyz_branch = self.appgs._xyz[branch_mask_app]
+        if isinstance(self.nn_stpr_appgs, list):        
+            nn_stpr_appgs = torch.stack(self.nn_stpr_appgs, dim=0).to(self.device)
+        else:                                           
+            nn_stpr_appgs = self.nn_stpr_appgs.to(self.device)        
+        parent_global_leaf   = nn_stpr_appgs[leaf_mask_app]   
+        parent_global_branch = nn_stpr_appgs[branch_mask_app]
+
+        parent_local_leaf   = global2local_leaf[parent_global_leaf]     # (M_leaf,)
+        parent_local_branch = global2local_branch[parent_global_branch] # (M_branch,)
+
+        # (c) compute distance
+        dist_leaf   = gs_to_disk_distance(xyz_leaf,   parent_local_leaf,   disk_param)
+        dist_branch = gs_to_cylinder_distance(xyz_branch, parent_local_branch, cyl_param)
+
+        loss_disk      = (dist_leaf**2).mean()
+        loss_cylinder  = (dist_branch**2).mean() 
+        loss_bind = loss_disk + loss_cylinder
+        return loss_bind
+        
+        
+
+        
+        
+    def compute_gaussian_binding_loss(self, n_samples=1, reduction=Literal['sum','mean'],method=Literal['surface', 'mahalanobis']):
+        """
+        Compute binding loss from appgs to structure_gs.
+        This reflects how well appgs are spatially explained by stprs.
+
+        Args:
+            nn_idx: LongTensor (N, K) - stpr neighbors for each appg
+            n_samples: int - how many samples to simulate per gaussian
+            reduction: 'mean' | 'sum' | 'none'
+
+        Returns:
+            loss: scalar or (N,) if reduction='none'
+        """
+        nn_idx = self.nn_stpr_appgs
+        N = len(nn_idx)
+
+        if method == "mahalanobis":
+            # 1. Sample appg points
+            if n_samples == 1:
+                samples = self.appgs._xyz.unsqueeze(1)  # (N, 1, 3)
             else:
-                self.parent[rootY] = rootX
-                self.rank[rootX] += 1
+                samples = self.appgs._xyz.unsqueeze(1) + quaternion_apply(
+                    self.appgs._rotation.unsqueeze(1),
+                    self.appgs._scaling.unsqueeze(1) * torch.randn(N, n_samples, 3, device=self.device)
+                )  # (N, n_samples, 3)
+
+            # 2. Neighbor gaussians
+            nbr_xyz   = self.structure_gs._xyz[nn_idx]         # (N, K, 3)
+            nbr_rot   = self.structure_gs._rotation[nn_idx]    # (N, K, 4)
+            nbr_scale = self.structure_gs._scaling[nn_idx]     # (N, K, 3)
+
+            # 3. Compute offset from appgs to neighbor centers
+            offset = samples.unsqueeze(1) - nbr_xyz.unsqueeze(2)  # (N, K, n_samples, 3)
+
+            # 4. Transform offset to local stpr space
+            local_offset = quaternion_apply(
+                quaternion_invert(nbr_rot).unsqueeze(2),  # (N, K, 1, 4)
+                offset  # (N, K, n_samples, 3)
+            )
+
+            # 5. Normalize by inverse scale
+            normed = local_offset / nbr_scale.unsqueeze(2)  # (N, K, n_samples, 3)
+
+            # 6. Distance as binding loss
+            dist = torch.norm(normed, dim=-1)  # (N, K, n_samples)
+
+            dist = dist.mean(dim=-1)  # (N, K) → mean over samples
+
+            # 7. Aggregate per-appg
+            loss_per_appg = dist.mean(dim=-1)  # (N,)
+
+            if reduction == 'mean':
+                return loss_per_appg.mean()
+            elif reduction == 'sum':
+                return loss_per_appg.sum()
+            else:
+                return loss_per_appg  # (N,)
+        elif method == "surface":
+            """ approximate the distance between appg and stpr by the distance between appg and the surface of stpr """
+            loss_bind = self.build_surface()
+            return loss_bind
+
+    def stpr_to_graph(self,opacity_threshold=0, anisotrpopy_threshold=1,save_mst=False):  # 0.2 ,30
+        # MST for grpah extraction
+        # step1: Noise filtering
+        branch_mask = torch.tensor([lbl == 'branch' for lbl in self.structure_gs.stpr_label], device=self.device)
+        stpr_opcaity = self.structure_gs._opacity
+        # keep = stpr_opcaity > opacity_threshold # low opacity filter
+        # keep = keep.flatten()
+        # leaf like filter
+        anisotropy = self.structure_gs.get_scaling[:,0] / self.structure_gs.get_scaling[:,1]
+        anisotropy = torch.max(anisotropy, 1.0/anisotropy)
+        keep = (anisotropy > anisotrpopy_threshold).flatten()
+        
+        # step2: stpr to edge
+        keep = keep & branch_mask
+        center = self.structure_gs.get_xyz[keep] # (N,3)
+        scales = self.structure_gs.get_scaling[keep]
+        rot = self.structure_gs.get_rotation[keep]
+        rot_matrix = quaternion_to_matrix(rot) #
+        u = rot_matrix[:,:,0]
+        h = self.structure_gs.get_scaling[keep][:,0] * 1.5  
+        top = center + h.unsqueeze(1) * u
+        bottom = center - h.unsqueeze(1) * u
+        mst_edges, points = build_mst_from_endpoints(top,bottom)
+        if save_mst:
+            save_mst_ply(points, mst_edges)
+        # graph loss 
+        loss_graph = mst_loss(top,bottom,rot_matrix,mst_edges) 
+        return mst_edges, points,loss_graph
+
