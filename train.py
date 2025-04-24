@@ -274,7 +274,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 ssim_value = ssim(image, gt_image)
             Ll1_stpr = l1_loss(image_stprs, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + 0.5 * Ll1_stpr
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + 0.1 * Ll1_stpr
             # Depth regularization for stpr and appgs
             Ll1depth_pure = 0.0
             invDepth_appgs = None
@@ -319,7 +319,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss += loss_mst * opt.lambda_mst
                 
             loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface')
-            loss += loss_bind * 0.1
+            loss += loss_bind 
             loss += loss
             loss.backward()
 
@@ -389,7 +389,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         appgs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold,radii,flag='app')
                    
                         """ Adaptive densification control of stprs """
-                        grad_threshold_stpr = 0.0005
+                        grad_threshold_stpr = 0.001
                         if stprs.get_xyz.shape[0] < args.max_stpr_num:
                             size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                             stprs.densify_and_prune(grad_threshold_stpr, 0.005, scene.cameras_extent, size_threshold, radii_stprs,flag='stpr')
