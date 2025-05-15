@@ -136,7 +136,7 @@ def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False):
     from sklearn.cluster import DBSCAN
 
     # Dummy logic: let's just run DBSCAN to group roughly linear segments (can be seen as 'branches')
-    # (0.03,5) for plant4 | (0.005,5) for ficus
+    # (0.03,5) for plant4 | (0.005,5) for ficus | (0.05,5) for plant1
 
     clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(points) # 0.005,5
     labels = clustering.labels_
@@ -407,7 +407,7 @@ def gs_to_cylinder_distance(
         d_side[cap_mask]**2 + (t.abs().unsqueeze(1)[cap_mask]-h[cap_mask])**2
     )
     d_side[cap_mask] = d_cap
-    return d_side                           # (M,)
+    return d_side.squeeze(1)                           # (M,)
 
 
 # ────────────────────────────────────────────────────────────
@@ -419,9 +419,9 @@ def gs_to_disk_distance(
         disk_param# 'center','normal','a','b'
 ) -> torch.Tensor:                         # (M,)
     C = disk_param['center'][parent].squeeze(1)      # (M,3)
-    n = disk_param['normal'][parent] 
-    a = disk_param['a'][parent]            # (M,)
-    b = disk_param['b'][parent]            # (M,)
+    n = disk_param['normal'][parent].squeeze(1) 
+    a = disk_param['a'][parent].squeeze(1)           # (M,)
+    b = disk_param['b'][parent].squeeze(1)            # (M,)
     v = xyz - C
     d_plane = torch.abs(torch.sum(v * n, dim=-1))           # |z|
 
@@ -496,6 +496,7 @@ def stpr_to_cylinder(p, S, R,save_flag=True,resolution=32):
 
     if save_flag:
         mesh_all = o3d.geometry.TriangleMesh()
+        mesh_all_list = []
         for i in range(p.shape[0]):
             mesh = o3d.geometry.TriangleMesh.create_cylinder(
                 radius=float(r[i]), height=float(h[i]),
@@ -505,10 +506,11 @@ def stpr_to_cylinder(p, S, R,save_flag=True,resolution=32):
             mesh.rotate(_torch_to_numpy(R_align), center=(0, 0, 0))
             mesh.translate(_torch_to_numpy(p[i]))
             mesh_all = mesh_all + mesh
+            mesh_all_list.append(mesh)
         #o3d.io.write_triangle_mesh(f'branch_cylinder_vis.ply', mesh_all)
-        return {'center': p, 'axis': u_save, 'radius': r, 'half_len': h}, mesh_all
+        return {'center': p, 'axis': u_save, 'radius': r, 'half_len': h}, mesh_all, mesh_all_list
     else:
-        return {'center': p, 'axis': u_save, 'radius': r, 'half_len': h}, None
+        return {'center': p, 'axis': u_save, 'radius': r, 'half_len': h}, None,None
 
 def stpr_to_disk(p, S, R, save_flag=False,resolution=32):
     rot_matrix = quaternion_to_matrix(R)  # (N,3,3)
@@ -517,6 +519,7 @@ def stpr_to_disk(p, S, R, save_flag=False,resolution=32):
     u,v,n = rot_matrix[:, :, 0], rot_matrix[:, :, 1], rot_matrix[:, :, 2] 
     if save_flag:
         mesh_all = o3d.geometry.TriangleMesh()
+        mesh_all_list = []
         # 预生成圆周角度 (CPU 张量即可)
         theta = torch.linspace(0, 2*torch.pi, steps=resolution+1)[:-1]  # (R,)
         cos_t, sin_t = torch.cos(theta), torch.sin(theta)               # (R,)
@@ -542,11 +545,13 @@ def stpr_to_disk(p, S, R, save_flag=False,resolution=32):
             mesh.vertices  = o3d.utility.Vector3dVector(_torch_to_numpy(verts))
             mesh.triangles = o3d.utility.Vector3iVector(_torch_to_numpy(tri_idx))
             mesh.compute_vertex_normals()
-
+            mesh_all_list.append(mesh)
             mesh_all += mesh
         #TODO: fix rotation bug
         o3d.io.write_triangle_mesh('leaf_disk_vis.ply', mesh_all)
-    return {'center': p, 'normal': u, 'a': a, 'b': b}
+        return {'center': p, 'normal': n, 'a': a, 'b': b}, mesh_all,mesh_all_list
+    else:
+        return {'center': p, 'normal': u, 'a': a, 'b': b}, None, None
 
 def build_edge(top, bottom,save_edge=False):
         # save a mesh of edge
@@ -576,7 +581,7 @@ def build_edge(top, bottom,save_edge=False):
             PlyData([el_v, el_e], text=True).write('edge.ply')
         return verts, 2*idx, 2*idx +1
 
-def build_mst_from_endpoints(top, bottom, k:int=16):
+def build_mst_from_endpoints(top, bottom, k:int=3):
     top = top.detach().cpu().numpy()
     bottom = bottom.detach().cpu().numpy()
     N = top.shape[0]

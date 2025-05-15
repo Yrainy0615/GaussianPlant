@@ -176,3 +176,8 @@ def save_paired_points(top, bottom, pairs,  # pairs = tensor([[i,j],...])
     # ---------- 写 PLY ----------
     PlyData([el_v, el_e], text=True).write(ply_path)
     print(f'Saved {ply_path}  (verts {2*K}, edges {K})')
+
+def label_loss(label):
+    p = torch.sigmoid(label)
+    loss = p * (1 - p)
+    return loss

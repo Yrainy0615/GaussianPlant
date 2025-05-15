@@ -51,6 +51,7 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._depths = ""
+        self.mask_path = ""
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
@@ -81,7 +82,9 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.opacity_lr = 0.025
         self.scaling_lr = 0.005
+        self.scaling_lr_stpr = 0.01
         self.rotation_lr = 0.001
+        self.rotation_lr_stpr = 0.003
         self.exposure_lr_init = 0.01
         self.exposure_lr_final = 0.001
         self.exposure_lr_delay_steps = 0
@@ -92,10 +95,14 @@ class OptimizationParams(ParamGroup):
         self.lambda_align = 0.5
         self.lambda_overlap = 1
         self.lambda_freq = 0.2
-        self.lambda_opacity = 0.2
+        self.lambda_opacity = 0.05
+        self.lambda_ani = 0.01
         self.lambda_mst = 0.2
+        self.lambda_color = 0.01
+        self.lambda_bind = 0.2
+        self.lambda_geo = 1
         self.densification_interval = 100
-        self.opacity_reset_interval = 1
+        self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0005

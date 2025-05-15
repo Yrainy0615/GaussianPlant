@@ -33,7 +33,7 @@ class CameraInfo(NamedTuple):
     image_path: str
     image_name: str
     depth_path: str
-    # mask_path: str
+    mask_path: str
     width: int
     height: int
     is_test: bool
@@ -109,10 +109,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
-        # mask_path = os.path.join(mask_folder, f"{extr.name[:-n_remove]}.png") if mask_folder != "" else ""
+        mask_path = os.path.join(mask_folder, f"{extr.name[:-n_remove]}.JPG") if mask_folder != "" else ""
         
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
-                              image_path=image_path, image_name=image_name, depth_path=depth_path, 
+                              image_path=image_path, image_name=image_name, depth_path=depth_path, mask_path=mask_path,
                               width=width, height=height, is_test=image_name in test_cam_names_list)
         cam_infos.append(cam_info)
 
@@ -150,7 +150,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, masks,eval, train_test_exp, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -203,7 +203,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
         depths_folder=os.path.join(path, depths) if depths != "" else "", 
-        mask_folder=os.path.join(path,'masks'), test_cam_names_list=test_cam_names_list)
+        mask_folder=os.path.join(path,'masks') if masks != "" else "" , test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
@@ -258,7 +258,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
-
+            mask_path = os.path.join(path, frame["mask_path"] + extension) if "mask_path" in frame else ""
             im_data = np.array(image.convert("RGBA"))
 
             bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
@@ -274,7 +274,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
-                            image_path=image_path, image_name=image_name,
+                            image_path=image_path, image_name=image_name, mask_path=mask_path,
                             width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
             
     return cam_infos

@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, render_leaf_only=False, render_branch_only=False):
     """
     Render the scene. 
     
@@ -85,6 +85,35 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 shs = pc.get_features
     else:
         colors_precomp = override_color
+    # create leaf/branch mask
+    rendered_leaf = None
+    rendered_branch = None
+    p_leaf = torch.sigmoid(pc.label)
+    p_branch = 1 - p_leaf
+    if render_leaf_only:
+        weight = p_leaf
+        alpha_mod = pc.get_opacity * weight.unsqueeze(1)
+        rendered_leaf, radii, depth_image = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            opacities = alpha_mod,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp)
+    if render_branch_only:
+        weight = p_branch
+        alpha_mod = pc.get_opacity * weight.unsqueeze(1)
+        rendered_branch, radii, depth_image = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            opacities = alpha_mod,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     if separate_sh:
@@ -125,109 +154,109 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "depth" : depth_image
         }
     
-    return out
+    return out, rendered_leaf, rendered_branch
+
+def render_dynamic(viewpoint_camera,
+                   pc: GaussianModel,
+                   pipe,
+                   nn_stpr_app,
+                   bg_color,
+                   stpr_label,
+                   scaling_modifier=1.0,
+                   separate_sh=False,
+                   override_color=None,
+                   use_trained_exp=False):
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+        antialiasing=pipe.antialiasing
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc.get_scaling
+        rotations = pc.get_rotation
+
+    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    shs = None
+    colors_precomp = None
+    if override_color is None:
+        if pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        else:
+            if separate_sh:
+                dc, shs = pc.get_features_dc, pc.get_features_rest
+            else:
+                shs = pc.get_features
+    else:
+        colors_precomp = override_color
+    # -------- 1. 计算 AppG 激活掩码 ----------
+    parent_id = nn_stpr_app.squeeze(1)       # (M,)
+
+    # -------- 2. 常规准备 ----------
+    means3D = pc.get_xyz
+    means2D = screenspace_points
+    opacity_full = pc.get_opacity                 # (P+M,1) or (M,1)
+    leaf_mask = torch.sigmoid(stpr_label) >=0.5
+    leaf_index = torch.nonzero(leaf_mask, as_tuple=False).squeeze(1)[:,0]  # (L,)
+    opacity = opacity_full.clone()
+    remove_mask = torch.empty_like(opacity_full, dtype=torch.bool).squeeze(1)
+    remove_mask.fill_(False)
+    image_list = []
+    for i in torch.unique(parent_id):
+        if i in leaf_index:
+            appgs_filter = torch.nonzero(parent_id == i, as_tuple=False)
+            # align appgs_filter with remove_mask
+            app_mask = torch.isin(parent_id,appgs_filter)
+            gs_filter = torch.logical_or(app_mask, remove_mask)
+            opacity[gs_filter] = 1e-6
 
 
-# from diff_gaussian_rasterization_depth import GaussianRasterizationSettings as GaussianRasterizationSettingsDepth, GaussianRasterizer as GaussianRasterizerDepth
+            rendered_img, radii, depth = rasterizer(
+                means3D = means3D,
+                means2D = means2D,
+                shs     = shs,
+                colors_precomp = colors_precomp,
+                opacities = opacity,
+                scales = scales,
+                rotations = rotations,
+                cov3D_precomp = cov3D_precomp)
+            rendered_img = rendered_img.clamp(0, 1)
+            image_list.append(rendered_img)
 
-# def render_with_depth(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, override_mask = None, filtered_mask = None):
-#     """
-#     Render the scene. 
-    
-#     Background tensor (bg_color) must be on GPU!
-#     """
-#     # start_time  = time.time()
-#     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-#     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-#     try:
-#         screenspace_points.retain_grad()
-#     except:
-#         pass
-
-#     # Set up rasterization configuration
-#     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-#     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-#     raster_settings = GaussianRasterizationSettingsDepth(
-#         image_height=int(viewpoint_camera.image_height),
-#         image_width=int(viewpoint_camera.image_width),
-#         tanfovx=tanfovx,
-#         tanfovy=tanfovy,
-#         bg=bg_color,
-#         scale_modifier=scaling_modifier,
-#         viewmatrix=viewpoint_camera.world_view_transform,
-#         projmatrix=viewpoint_camera.full_proj_transform,
-#         sh_degree=pc.active_sh_degree,
-#         campos=viewpoint_camera.camera_center,
-#         prefiltered=False,
-#         debug=pipe.debug
-#     )
-
-#     # print("Render time checker: raster_settings", time.time() - start_time)
-#     # start_time  = time.time()
-
-
-#     rasterizer = GaussianRasterizerDepth(raster_settings=raster_settings)
-
-#     means3D = pc.get_xyz
-#     means2D = screenspace_points
-#     opacity = pc.get_opacity
-#     if filtered_mask is not None:
-#         new_opacity = opacity.detach().clone()
-#         new_opacity[filtered_mask, :] = -1.
-#         opacity = new_opacity
-
-#     mask = pc.get_mask if override_mask is None else override_mask
-
-#     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-#     # scaling / rotation by the rasterizer.
-#     scales = None
-#     rotations = None
-#     cov3D_precomp = None
-#     if pipe.compute_cov3D_python:
-#         cov3D_precomp = pc.get_covariance(scaling_modifier)
-#     else:
-#         scales = pc.get_scaling
-#         rotations = pc.get_rotation
-
-#     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-#     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-#     shs = None
-#     colors_precomp = None
-#     if override_color is None:
-#         if pipe.convert_SHs_python:
-#             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-#             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
-#             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-#             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-#             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-#         else:
-#             shs = pc.get_features
-#     else:
-#         colors_precomp = override_color
-
-#     # print("Render time checker: prepare vars", time.time() - start_time)
-
-
-#     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-#     rendered_image, rendered_mask, rendered_depth, radii = rasterizer(
-#         means3D = means3D,
-#         means2D = means2D,
-#         shs = shs,
-#         colors_precomp = colors_precomp,
-#         opacities = opacity,
-#         mask = mask,
-#         scales = scales,
-#         rotations = rotations,
-#         cov3D_precomp = cov3D_precomp)
-    
-#     # print("Render time checker: main render", time.time() - start_time)
-
-#     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-#     # They will be excluded from value updates used in the splitting criteria.
-#     return {"render": rendered_image,
-#             "mask": rendered_mask,
-#             "depth": rendered_depth,
-#             "viewspace_points": screenspace_points,
-#             "visibility_filter" : radii > 0,
-#             "radii": radii}
+    # 同 render()，返回结果
+    return image_list

@@ -1,7 +1,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim,  align_loss
+from utils.loss_utils import l1_loss, ssim,  align_loss, label_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -11,7 +11,6 @@ from tqdm import tqdm
 from utils.image_utils import psnr, save_tensor_as_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from pytorch3d.loss import chamfer_distance
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -34,8 +33,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
-
-    first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians_init = GaussianModel(dataset.sh_degree, opt.optimizer_type, args.device)
     appgs = None
@@ -64,20 +61,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
-
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
-    first_iter += 1
+    if os.path.exists(os.path.join(args.source_path, "points_3dgs.ply")):
+        first_iter = 7000  
+    else:
+        first_iter = 0
+        first_iter+=1
+    progress_bar = tqdm(range(first_iter, opt.iterations),initial=first_iter, desc="Training progress")
     # regularizer           
     loss_align = 0
-    loss_overlap = 0    
-    loss_freq = 0
+    loss_overlap = 0
+    loss_freq = 0    
     num_appgs = 0
     num_stprs = 0
     loss_bind = 0
-    loss_opacity_app = 0
-    loss_opacity_stprs = 0
     loss_mst = 0
     image_stprs = None
+    loss_label = 0
+    loss_ani = 0
+    loss_color = 0
+
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -95,24 +97,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 network_gui.conn = None
 
         iter_start.record()
-        if stprs is None:
-            # build our representation
-            if os.path.exists(os.path.join(args.source_path, "points_3dgs.ply")):
-                opt.iter_build_stprs= 1
-                opt.iter_build_appgs = 1
-            else:
-                opt.iter_build_stprs = 7000
-                opt.iter_build_appgs = 7000
-            if iteration == opt.iter_build_stprs:   # build stprs from inital gaussians
-                gaussians_init.load_ply(os.path.join(args.source_path, "points_3dgs.ply"))
-                stprs,appgs = gaussians_init.build_stprs_from_gs(num_clusters=100, method='3dgs')
-                stprs.training_setup(opt)
-                appgs.training_setup(opt)
-                stprs.save_ply(os.path.join(scene.model_path, "stprs_init.ply"))
-                appgs.save_ply(os.path.join(scene.model_path, "appgs_init.ply"))
-                process_state = "appgs"
-            # gaussians_init.update_nn_between_appgs_and_stprs()
- 
+        opt.iter_build_stprs = 7000
+        opt.iter_build_appgs = 7001
+
+        if iteration == opt.iter_build_stprs:   # build stprs from inital gaussians
+            gaussians_init.load_ply(os.path.join(args.source_path, "points_3dgs.ply"))
+            stprs = gaussians_init.build_stprs_from_gs(num_clusters=100, method='3dgs')
+            stprs.training_setup(opt)
+            stprs.save_ply(os.path.join(scene.model_path, "stprs_init.ply"))
+            process_state = "stprs"
+
+        if iteration == opt.iter_build_appgs: 
+            appgs = gaussians_init.build_appgs_from_stprs()
+            appgs.training_setup(opt)
+            appgs.save_ply(os.path.join(scene.model_path, "appgs_init.ply"))
+            gaussians_init.update_nn_between_appgs_and_stprs()
+            gaussians_init.save_stpr_app_correspondence(os.path.join(scene.model_path,'stpr_app_correspondence'))
+            process_state = 'appgs'
          # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
@@ -122,7 +123,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         vind = viewpoint_indices.pop(rand_idx)
         # Load GT
         gt_image = viewpoint_cam.original_image.to(args.device)
-        # gt_mask = viewpoint_cam.mask.to(args.device).unsqueeze(0)
+        if viewpoint_cam.mask is not None: 
+            gt_mask = viewpoint_cam.mask.to(args.device).unsqueeze(0)
         
         # Render
         if (iteration - 1) == debug_from:
@@ -141,13 +143,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # render
 
-            render_pkg = render(viewpoint_cam, gaussians_init, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            render_pkg,render_leaf,render_branch = render(viewpoint_cam, gaussians_init, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             image,  depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             if viewpoint_cam.alpha_mask is not None:
                         alpha_mask = viewpoint_cam.alpha_mask.to(args.device)
                         image *= alpha_mask
             
             # Basic Loss
+            if args.reg_mask:
+                gt_image = gt_image*gt_mask
+                image = image*gt_mask
+      
             Ll1 = l1_loss(image, gt_image)
             if FUSED_SSIM_AVAILABLE:
                 ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -197,7 +203,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 stprs.oneupSHdegree()
 
             # render
-            render_pkg = render(viewpoint_cam, stprs, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            render_pkg,render_leaf,render_branch = render(viewpoint_cam, stprs, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             # render_pkg = render_with_depth(viewpoint_cam, stprs, pipe, bg)
             image_stprs, depth_stpr, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             image = image_stprs
@@ -206,13 +212,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 image_stprs *= alpha_mask
             
             # Basic Loss
-            # Ll1 = l1_loss(image_stprs, gt_image)
-            # if FUSED_SSIM_AVAILABLE:
-            #     ssim_value = fused_ssim(image_stprs.unsqueeze(0), gt_image.unsqueeze(0))
-            # else:
-            #     ssim_value = ssim(image_stprs, gt_image)
-            # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-            loss = 0
+            if args.reg_mask:
+                image = image*gt_mask
+                gt_image = gt_image*gt_mask
+            Ll1 = l1_loss(image, gt_image)
+
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            else:
+                ssim_value = ssim(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
             # Depth regularization
             Ll1depth_pure = 0.0
             invDepth = None
@@ -243,14 +252,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_align = align_loss(stprs, neighbor_idx)
                 loss+= loss_align * opt.lambda_align
             if args.reg_overlap:
-                gaussian_overlap = stprs.compute_gaussian_overlap_with_neighbors(neighbor_idx)
-                loss_overlap = (1-gaussian_overlap.mean())
-                loss += loss_overlap * opt.lambda_overlap
-            if args.reg_freq:
-                loss_freq = stprs.low_freq_loss()
-                loss += loss_freq * opt.lambda_freq
+                gaussian_overlap = stprs.compute_gaussian_separation_with_neighbors(neighbor_idx)
+                # loss_overlap = (1-gaussian_overlap.mean())
+                loss += gaussian_overlap * opt.lambda_overlap
+            if args.reg_opacity:
+                loss_opacity = stprs.opacity_regularizer()
+                loss += loss_opacity * opt.lambda_freq
+            if args.reg_ani and iteration>8000:
+                loss_ani = stprs.compute_gaussian_anisotropy(tau=10)
+                loss += loss_ani * opt.lambda_ani
             # binding loss
-            
+            loss_label = label_loss(stprs.label).mean()
+            loss +=loss_label*0.2
             loss.backward()
             
         elif process_state == "appgs":
@@ -260,21 +273,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 1000 == 0:
                 appgs.oneupSHdegree()
                 
-            render_pkg_stprs = render(viewpoint_cam, stprs, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-            render_pkg_appgs = render(viewpoint_cam, appgs, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            render_pkg_stprs,render_leaf,render_branch = render(viewpoint_cam, stprs, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, render_leaf_only=True,render_branch_only=True)
+            render_pkg_appgs,render_leaf_appgs,_ = render(viewpoint_cam, appgs, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             image_stprs, depth_stprs, viewspace_point_tensor_stprs, visibility_filter_stprs, radii_stprs = render_pkg_stprs["render"], render_pkg_stprs["depth"], render_pkg_stprs["viewspace_points"], render_pkg_stprs["visibility_filter"], render_pkg_stprs["radii"]
             image, depth_appgs, viewspace_point_tensor, visibility_filter, radii = render_pkg_appgs["render"], render_pkg_appgs["depth"], render_pkg_appgs["viewspace_points"], render_pkg_appgs["visibility_filter"], render_pkg_appgs["radii"]
             if viewpoint_cam.alpha_mask is not None:
                 alpha_mask = viewpoint_cam.alpha_mask.to(args.device)
                 image *= alpha_mask
             # Basic Loss
-            Ll1 = l1_loss(image, gt_image)
+            if args.reg_mask:
+                image = image*gt_mask
+                image_stprs = image_stprs*gt_mask
+                gt_image = gt_image*gt_mask
+
+            Ll1 = l1_loss(image, gt_image)  
+            Ll1_stpr = l1_loss(image_stprs, gt_image)          
             if FUSED_SSIM_AVAILABLE:
                 ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
             else:
                 ssim_value = ssim(image, gt_image)
-            Ll1_stpr = l1_loss(image_stprs, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + 0.5 * Ll1_stpr
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) +  Ll1_stpr
             # Depth regularization for stpr and appgs
             Ll1depth_pure = 0.0
             invDepth_appgs = None
@@ -296,7 +314,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # regularizer           
 
-            if iteration >100:
+            if iteration >3000:
                 # appgs.reset_neighbors()
                 stprs.reset_neighbors()
                 neighbor_idx  = stprs.get_neighbors_of_random_points(-1)
@@ -307,19 +325,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_align = align_loss(appgs, neighbor_idx_app)
                     loss+= loss_align * opt.lambda_align
                 if args.reg_overlap:
-                    gaussian_overlap = stprs.compute_gaussian_overlap_with_neighbors(neighbor_idx)
-                    loss_overlap = 1-gaussian_overlap.mean()
-                    loss += loss_overlap * opt.lambda_overlap
+                    # gaussian_overlap = stprs.compute_gaussian_overlap_with_neighbors(neighbor_idx, only_branch=True)
+                    gaussian_overlap = stprs.compute_gaussian_separation_with_neighbors(neighbor_idx)
+                    # loss_overlap = 1-gaussian_overlap.mean()
+                    loss += gaussian_overlap * opt.lambda_overlap
                 if args.reg_opacity:
                     loss_opacity_app = appgs.opacity_regularizer()
                     loss_opacity_stprs = stprs.opacity_regularizer()
                     loss += loss_opacity_app * opt.lambda_opacity + loss_opacity_stprs * opt.lambda_opacity
-                if args.reg_mst:
+                if args.reg_mst and iteration>9000:
                     _,_,loss_mst = gaussians_init.stpr_to_graph()
                     loss += loss_mst * opt.lambda_mst
+                if args.reg_ani and iteration>8000:
+                    loss_ani = stprs.compute_gaussian_anisotropy(tau=10)
+                    loss += loss_ani * opt.lambda_ani
                 
             loss_bind = gaussians_init.compute_gaussian_binding_loss(method='surface')
-            loss += loss_bind * 0.1
+            loss_label = label_loss(stprs.label).mean()
+            loss += loss_bind * opt.lambda_bind
+            if args.reg_color:
+                loss_color = stprs.color_loss()
+                loss += loss_label + loss_color * opt.lambda_color
+            if args.reg_geo:
+                loss_geo = gaussians_init.geometric_loss()
+                loss += loss_geo * opt.lambda_geo
+
             loss += loss
             loss.backward()
 
@@ -346,7 +376,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 num_appgs = appgs.get_xyz.shape[0]
             if stprs is not None:
                 num_stprs = stprs.get_xyz.shape[0]
-            training_report(tb_writer, iteration, Ll1, loss, Ll1depth_pure,loss_align, loss_overlap,l1_loss, testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, image,  invDepth_appgs,invDepth_stprs,mono_invdepth, image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_app, loss_opacity_stprs, loss_bind,loss_mst)
+            training_report(tb_writer, iteration, Ll1, loss, Ll1depth_pure,loss_align, loss_overlap,l1_loss, testing_iterations, scene, 
+                            render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, image,  render_leaf, render_branch,
+                            image_stprs,loss_freq, num_appgs, num_stprs, loss_bind,loss_mst, loss_label,loss_ani,loss_color)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration,save_app=True,save_stpr=True,save_branch=True)
@@ -365,18 +397,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                         gaussians_init.reset_opacity()
                 
-                elif process_state == "stprs":
-                    stprs.max_radii2D[visibility_filter] = torch.max(stprs.max_radii2D[visibility_filter], radii[visibility_filter])
-                    stprs.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval:
-                        if stprs._xyz.shape[0]<=args.max_stpr_num:
-                            size_threshold = 30 if iteration > opt.opacity_reset_interval else None # size_threshold:20
-                            stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, size_threshold_small=None)
-                        else:
-                            size_threshold = 30 if iteration > opt.opacity_reset_interval else None
-                            stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent*10, size_threshold, radii, only_prune=True)
-                    if iteration % opt.opacity_reset_interval == 0:
-                        stprs.reset_opacity_stpr()
+                # elif process_state == "stprs":
+                #     stprs.max_radii2D[visibility_filter] = torch.max(stprs.max_radii2D[visibility_filter], radii[visibility_filter])
+                #     stprs.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                #     if iteration > opt.densify_from_iter and iteration % opt.densification_interval==0:
+                #         if stprs._xyz.shape[0]<=args.max_stpr_num:
+                #             size_threshold = 60 if iteration > opt.opacity_reset_interval else None # size_threshold:20
+                #             stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, size_threshold_small=True)
+                #         else:
+                #             size_threshold = 60 if iteration > opt.opacity_reset_interval else None
+                #             stprs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent*10, size_threshold, radii, only_prune=True)
+                #     if iteration % opt.opacity_reset_interval == 0:
+                #         stprs.reset_opacity_stpr()
 
 
                 elif process_state == "appgs":
@@ -389,15 +421,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         appgs.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold,radii,flag='app')
                    
                         """ Adaptive densification control of stprs """
-                        grad_threshold_stpr = 0.0005
+                        grad_threshold_stpr = 0.01
                         if stprs.get_xyz.shape[0] < args.max_stpr_num:
-                            size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                            stprs.densify_and_prune(grad_threshold_stpr, 0.005, scene.cameras_extent, size_threshold, radii_stprs,flag='stpr')
+                            size_threshold = 40 if iteration > opt.opacity_reset_interval else None
+                            stprs.densify_and_prune(grad_threshold_stpr, 0.005, scene.cameras_extent, size_threshold, radii_stprs,flag='stpr', nn_stpr_app=None)
 
                         else:
-                            stprs.densify_and_prune(grad_threshold_stpr, 0.005, scene.cameras_extent, size_threshold, radii_stprs, only_prune=True,flag='stpr')
-                        gaussians_init.update_nn_between_appgs_and_stprs()
-               
+                            stprs.densify_and_prune(grad_threshold_stpr,0.005, scene.cameras_extent, size_threshold, radii_stprs, only_prune=True,flag='stpr',size_threshold_small=True,nn_stpr_app=None)
+                    gaussians_init.update_nn_between_appgs_and_stprs()
+
             # Optimizer step
             if iteration < opt.iterations:
                 if process_state == "init":
@@ -442,8 +474,8 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, loss_depth,loss_align,loss_overlap,l1_loss, testing_iterations, 
-                    scene : Scene, renderFunc, renderArgs, train_test_exp, image, depth_appgs, depth_stprs
-,mono_invdepth,image_stprs,loss_freq, num_appgs, num_stprs, loss_opacity_appgs, loss_opacity_stprs, loss_bind,loss_mst):
+                    scene : Scene, renderFunc, renderArgs, train_test_exp, image, render_leaf, render_branch,
+                    image_stprs,loss_freq, num_appgs, num_stprs, loss_bind,loss_mst, loss_label,loss_ani, loss_color):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -453,21 +485,26 @@ def training_report(tb_writer, iteration, Ll1, loss, loss_depth,loss_align,loss_
         tb_writer.add_scalar('train_loss_patches/freq_loss', loss_freq, iteration)
         tb_writer.add_scalar('train_loss_patches/num_appgs', num_appgs, iteration)
         tb_writer.add_scalar('train_loss_patches/num_stprs', num_stprs, iteration)
-        tb_writer.add_scalar('train_loss_patches/opacity_loss_appgs', loss_opacity_appgs, iteration)
-        tb_writer.add_scalar('train_loss_patches/opacity_loss_stprs', loss_opacity_stprs, iteration)
         tb_writer.add_scalar('train_loss_patches/binding_loss', loss_bind, iteration)
         tb_writer.add_scalar('train_loss_patches/mst_loss', loss_mst, iteration)
+        tb_writer.add_scalar('train_loss_patches/label_loss', loss_label, iteration)
+        tb_writer.add_scalar('train_loss_patches/ani_loss', loss_ani, iteration)
+        tb_writer.add_scalar('train_loss_patches/color_loss', loss_color, iteration)
         
         # add image 
         tb_writer.add_images('train_image_patches/render', image[None], global_step=iteration)
-        if depth_stprs is not None:
-            tb_writer.add_images('train_image_patches/depth_stprs', depth_stprs[None], global_step=iteration)
-        if depth_appgs is not None:
-            tb_writer.add_images('train_image_patches/depth_appgs', depth_appgs[None], global_step=iteration)
-        if mono_invdepth is not None:
-            tb_writer.add_images('train_image_patches/mono_invdepth', mono_invdepth[None], global_step=iteration)
+        # if depth_stprs is not None:
+        #     tb_writer.add_images('train_image_patches/depth_stprs', depth_stprs[None], global_step=iteration)
+        # if depth_appgs is not None:
+        #     tb_writer.add_images('train_image_patches/depth_appgs', depth_appgs[None], global_step=iteration)
+        # if mono_invdepth is not None:
+        #     tb_writer.add_images('train_image_patches/mono_invdepth', mono_invdepth[None], global_step=iteration)
         if image_stprs is not None:
             tb_writer.add_images('train_image_patches/stprs_render', image_stprs[None], global_step=iteration)
+        if render_leaf is not None:
+            tb_writer.add_images('train_image_patches/render_leaf', render_leaf[None], global_step=iteration)
+        if render_branch is not None:
+            tb_writer.add_images('train_image_patches/render_branch', render_branch[None], global_step=iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -480,7 +517,8 @@ def training_report(tb_writer, iteration, Ll1, loss, loss_depth,loss_align,loss_
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    out,_,_ = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                    image = torch.clamp(out["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
@@ -514,10 +552,10 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000,7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[300,1000,2000,3000,5000,7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000,6999, 8000,10_000,15_000,30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3000,7000,15000,30000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[8000,15000,30000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
     parser.add_argument("--reg_mask", action="store_true", default=False)
@@ -526,6 +564,9 @@ if __name__ == "__main__":
     parser.add_argument("--reg_freq", action="store_true", default=False)
     parser.add_argument("--reg_opacity", action="store_true", default=False)
     parser.add_argument("--reg_mst", action="store_true", default=False)
+    parser.add_argument("--reg_color", action="store_true", default=False)
+    parser.add_argument("--reg_geo", action="store_true", default=False)
+    parser.add_argument("--reg_ani", action="store_true", default=False)
     parser.add_argument("--max_stpr_num", type=int, default=2000 )
 
     

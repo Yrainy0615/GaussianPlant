@@ -2,22 +2,43 @@
   "version": "0.2.0",
   "configurations": [
       {
-          "name": "Python Debug",
+          "name": "Train Debug",
           "type": "debugpy",
           "request": "launch",
           "program": "${workspaceFolder}/train.py",
           "console": "integratedTerminal",
           "args": [
               "-s", "data/ficus",
-              "-m", "output/ficus_debug/test",
-              "--gpu", "1",
-              "--port", "6007",
-            //   "--reg_overlap",
+              "-m", "output/ficus_debug/debug",
+              "--gpu", "0",
+              "--port", "6017",
+              "--max_stpr_num", "200",
+              // "-d", "depths",
+              // "--mask_path", "masks",
+              "--reg_color",
+             // "--reg_ani",
+             // "--reg_overlap",
+              // "--reg_geo",
+              // "--reg_opacity",
             //   "--reg_align",
             //   "--reg_mst",
               // "--start_checkpoint", "7000",
           ],
           "justMyCode": true
-      }
-  ]
+      },
+  
+      {
+        "name": "Render Debug",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/render.py",
+        "console": "integratedTerminal",
+        "args": [
+          "-m", "output/ficus_debug/grad_0.01_max500_col_wo_bind",
+          "--skip_test",  "--render_deform", 
+        "--skip_train",
+        ],
+        "justMyCode": true
+      },
+    ]
 }

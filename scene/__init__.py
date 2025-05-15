@@ -32,6 +32,10 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        if args.mask_path is not None:
+            mask = args.mask_path
+        else:
+            mask = None
 
         if load_iteration:
             if load_iteration == -1:
@@ -44,7 +48,7 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, mask,args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
@@ -92,14 +96,17 @@ class Scene:
         if save_stpr and self.gaussians.structure_gs is not None:
             point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
             self.gaussians.structure_gs.save_ply(os.path.join(point_cloud_path, "stprs.ply"))
+            self.gaussians.structure_gs.save_ply(os.path.join(point_cloud_path, "stprs_branch.ply"),save_only_branch=True)
+            self.gaussians.save_stpr_app_correspondence(os.path.join(point_cloud_path, "stpr_app_correspondence"))
         if save_app and self.gaussians.appgs is not None:
             point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-            self.gaussians.appgs.save_ply(os.path.join(point_cloud_path, "apps.ply"))
-        if save_branch:
+            self.gaussians.appgs.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        if save_branch and self.gaussians.cylinder_mesh is not None:
+            self.gaussians.build_surface()
             branch = self.gaussians.cylinder_mesh
             branch_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
             o3d.io.write_triangle_mesh(os.path.join(branch_path, "branch.ply"), branch)
-        if save_mst:
+        if save_mst and self.gaussians.structure_gs is not None:
             mst_edges, points,_ = self.gaussians.stpr_to_graph()
             save_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
             save_mst_ply(points, mst_edges, os.path.join(save_path, "mst.ply"))
@@ -107,7 +114,7 @@ class Scene:
             image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
             for image_name in self.gaussians.exposure_mapping
         }
-        if iteration ==7000 and self.gaussians.structure_gs is None:
+        if iteration ==6999 and self.gaussians.structure_gs is None:
             point_cloud_path= os.path.join(self.args.source_path, "points_3dgs.ply")
             self.gaussians.save_ply(point_cloud_path)
         with open(os.path.join(self.model_path, "exposure.json"), "w") as f:

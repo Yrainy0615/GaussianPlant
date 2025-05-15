@@ -20,9 +20,14 @@ WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     image = Image.open(cam_info.image_path)
-    # mask = Image.open(cam_info.mask_path).convert("L") 
-    # mask_tensor = torch.from_numpy(np.array(mask)).float()
-    # mask_tensor = (mask_tensor > 128).float()
+    mask_binary = None
+    if cam_info.mask_path != "":
+        mask = Image.open(cam_info.mask_path).convert('L')
+        mask_pil = mask.resize((image.size[0], image.size[1]), Image.NEAREST)
+        mask_np = np.array(mask_pil)
+        mask_binary = (mask_np > 128 ).astype(np.uint8)
+    
+
     invdepthmap = None
     if cam_info.depth_path != "":
         try:
@@ -68,7 +73,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
 
     return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap, 
+                  image=image, invdepthmap=invdepthmap, mask=mask_binary,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
 
