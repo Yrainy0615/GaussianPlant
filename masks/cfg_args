@@ -1,1 +1,0 @@
-Namespace(sh_degree=3, source_path='/home/yyang/mnt/workspace/data/plant4', model_path='masks', images='images', depths='depths', mask_path='', resolution=-1, white_background=True, train_test_exp=False, data_device='cuda', eval=True)
