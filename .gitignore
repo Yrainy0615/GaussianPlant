@@ -11,9 +11,13 @@ data
 Depth-Anything-V2
 *.obj
 *.mtl
-third_party
 checkpoints
-diff-gaussian-rasterization-feature
+
+# third_party holds the Feature-3DGS submodule (Step 1). Keep the dir tracked for the
+# submodule, but ignore the old locally-vendored rasterizer copy and build artefacts.
+third_party/diff-gaussian-rasterization-feature/
+third_party/**/*.egg-info/
+third_party/**/*.so
 
 # third-party feature/depth encoders (Step 1 only)
 dinov3

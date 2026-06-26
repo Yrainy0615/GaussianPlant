@@ -11,3 +11,6 @@
 [submodule "submodules/fused-ssim"]
 	path = submodules/fused-ssim
 	url = https://github.com/rahul-goel/fused-ssim.git
+[submodule "third_party/feature-3dgs"]
+	path = third_party/feature-3dgs
+	url = https://github.com/ShijieZhou-UCLA/feature-3dgs.git

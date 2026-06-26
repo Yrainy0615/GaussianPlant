@@ -60,15 +60,16 @@ pip install --no-build-isolation ./submodules/simple-knn
 ```
 
 **Step 1 only (feature 3DGS pretraining).** Step 2 (structure extraction, the rest of
-this README) runs entirely on gsplat and needs nothing more. The feature-3DGS
-pretraining in `third_party/` uses a separate CUDA rasterizer that renders N-d
-semantic features; install it only if you intend to (re)run Step 1:
+this README) runs entirely on gsplat and needs nothing above. Step 1 uses the
+upstream [Feature-3DGS](https://github.com/ShijieZhou-UCLA/feature-3dgs) project,
+included as a submodule at `third_party/feature-3dgs`. It ships its **own** conda
+environment (`feature_3dgs`, python 3.8 / cu118) and CUDA rasterizer — keep it
+entirely separate from the `gsplant` env. Pull and set it up only if you intend to
+(re)run Step 1:
 ```shell
-pip install --no-build-isolation ./third_party/diff-gaussian-rasterization-feature
+git submodule update --init --recursive third_party/feature-3dgs
+# then follow third_party/feature-3dgs/README.md (its own env + rasterizer build)
 ```
-Note this package and the gsplat backend both expose `diff_gaussian_rasterization`/
-rendering paths — keep Step 1 (feature rasterizer) and Step 2 (gsplat) conceptually
-separate; you only need the feature rasterizer installed while pretraining.
 
 gsplat compiles its CUDA kernels the first time it is used (~90 s). For that it
 needs `nvcc` and `ninja` on `PATH`. If compilation fails (e.g. *"Ninja is required
@@ -94,7 +95,7 @@ Datasets live under `--root_path` (e.g. `/mnt/data/gaussianplant_data`). A scene
 ```
 newplant9/
 ├── sparse/0, images/, masks/, depths/   # COLMAP scene
-├── dinov3_dim128/                        # per-view DINOv3 features (branch/leaf)
+├── dinov3_dim128/                        # per-view DINOv3+JaFAR feature maps, PCA-128 (Step 1a)
 └── feature_pretrain/point_cloud/iteration_30000/
     ├── point_cloud.ply                   # 3DGS + 128-d semantic + label (StrPr/AppGS source)
     └── point_cloud_branch_dense.ply      # GT dense branch points (Chamfer target)
@@ -106,43 +107,49 @@ Shared assets `dinov3_pca.pth` and `dinov3_text_feats.pth` sit at `--root_path`.
 ## Pipeline
 
 ```
-   multi-view images ──▶  [Step 1] Feature 3DGS pretrain  ──▶  [Step 2] Structure extraction
-                                (DINOv3-feature 3DGS)              (this repo: StrPr + AppGS)
-                          produces feature_pretrain/ +             produces branch cylinders,
-                          pretrain_clean/*.ply                     skeleton (MST), bound AppGS
+  images ─▶ [Step 1a] DINOv3 + JaFAR    ─▶ [Step 1b] Feature-3DGS   ─▶ [Step 2] Structure extraction
+            per-view feature maps          distill into feature 3DGS    (this repo: StrPr + AppGS)
+            (preprocessing, dinov3_dim128) (submodule; feature_pretrain  branch cylinders, skeleton
+                                            + pretrain_clean/*.ply)      (MST), bound AppGS
 ```
 
-### Step 1 — Feature 3DGS pretraining  *(third-party backend)*
+### Step 1 — Feature 3DGS pretraining
 
-The feature-3DGS pretraining trains a 3DGS augmented with a per-Gaussian 128-d
-DINOv3 semantic feature (and a branch/leaf label channel). It renders those features
-with the **feature rasterizer** vendored under
-[`third_party/diff-gaussian-rasterization-feature`](third_party/diff-gaussian-rasterization-feature)
-(install it as shown in the Installation section). The runner is
-[`train_3dgs_semantic.py`](train_3dgs_semantic.py):
+**Step 1a — Per-view features (data preprocessing; recommended, no code in this repo).**
+The 2D semantic features that Step 1b distills are produced as an offline
+preprocessing pass, *not* by Feature-3DGS's built-in LSeg/SAM encoders. We recommend:
+extract patch features with a **DINO / DINOv3** backbone, then **upsample them to full
+image resolution with [JaFAR](https://github.com/PaulCouairon/JaFAR)** (a learned
+feature upsampler) to get dense, edge-aligned per-pixel feature maps; PCA-reduce to
+**128-d** and write one map per view under `<scene>/dinov3_dim128/` (with the shared
+`dinov3_pca.pth` at `--root_path`). These maps are the input to Step 1b — keep this as
+your own data-preprocessing script; this repo intentionally does not ship it.
+
+**Step 1b — Distillation into a feature 3DGS** *(via the Feature-3DGS submodule).*
+Distillation is handled by the upstream
+**[Feature-3DGS](https://github.com/ShijieZhou-UCLA/feature-3dgs)**, pinned as a
+submodule at [`third_party/feature-3dgs`](third_party/feature-3dgs) (we no longer
+maintain a custom pretraining script). Point it at the precomputed feature maps from
+Step 1a (in place of its default encoder), set the feature dimension to **128**
+(`NUM_SEMANTIC_CHANNELS` in
+`third_party/feature-3dgs/.../diff-gaussian-rasterization-feature/cuda_rasterizer/config.h`),
+and run it in its **own** environment:
 
 ```shell
-# prerequisites: per-view DINOv3 features under <scene>/dinov3_dim128/
-#                (extracted with the dinov3/ encoder; depths via Depth-Anything-V2/)
-python train_3dgs_semantic.py \
-  --source_path /mnt/data/gaussianplant_data/newplant9 \
-  --root_path   /mnt/data/gaussianplant_data \
-  --feature_path dinov3_dim128 \
-  --model_path  /mnt/data/gaussianplant_data/newplant9/feature_pretrain \
-  --gpu 0
+git submodule update --init --recursive third_party/feature-3dgs
+cd third_party/feature-3dgs   # create its env + build its rasterizer (see its README)
+python train.py -s <scene> -m <scene>/feature_pretrain --speedup --iterations 30000
 ```
 
-This produces the assets Step 2 consumes (its input contract):
+Step 2 only needs these produced assets (its input contract):
 - `feature_pretrain/point_cloud/iteration_30000/point_cloud.ply` — 3DGS with the
-  128-d semantic feature and the per-Gaussian branch/leaf label channel.
+  128-d semantic feature and a per-Gaussian branch/leaf label channel.
 - `pretrain_clean/<scene>_clean_pruned.ply` — the same cloud with pot/background
   removed (what Step 2 clusters into StrPr).
 - `dinov3_pca.pth`, `dinov3_text_feats.pth` at `--root_path`.
 
-> The feature rasterizer, `dinov3/` (feature encoder) and `Depth-Anything-V2/`
-> (monocular depth) are upstream third-party components and are git-ignored; clone /
-> download them into place before running Step 1. Step 2 does **not** need any of
-> them — it only reads the produced `.ply` assets above.
+> Step 2 does **not** need Feature-3DGS, its env, or its rasterizer — it only reads
+> the produced `.ply` assets above and runs on gsplat.
 
 ### Step 2 — Structure extraction (this repo)
 
@@ -157,13 +164,19 @@ python train.py \
   --model_path  output/newplant9/run \
   --clean_ply   pretrain_clean/newplant9_clean_pruned.ply \
   --label_init joint --branch_frac -1 --cluster_size 40 \
-  --reg_bind --reg_overlap --overlap_from 500 \
+  --reg_bind \
   --reg_axis  --lambda_axis 1.0 \
   --reg_graph --graph_from 1000 --graph_interval 50 \
   --prune_isolated --prune_from 1500 --prune_interval 500 --prune_until 4000 \
   --densify_branch --branch_split_ratio 1.5 --max_strpr_num 4000 \
   --label_lr 0 --iterations 7000 --disable_viewer
 ```
+
+> **Do not add `--reg_overlap`.** The SuGaR-style overlap regulariser minimises
+> neighbour overlap by collapsing each Gaussian's cross-section, which streaks the
+> **leaf** StrPr into thin needles (in-plane elongation went 1.8 → ~185 on some
+> scenes) while leaving the branch Chamfer unchanged. It is off by default; keep it
+> off unless you add a per-class variant that spares the leaf disks.
 
 `--clean_ply` loads the background-removed feature cloud; StrPr are built by
 clustering it and AppGS are bound to them. (Alternatively, drop `--clean_ply` and
@@ -182,7 +195,7 @@ per plant):
 
 | flag | default | what it controls / when to change |
 |------|---------|-----------------------------------|
-| `--branch_frac` | `-1` (auto) | Fraction of StrPr initialised as **branch**. `-1` auto-calibrates via Otsu (capped). If too many leaves are called branch (or vice-versa), set it manually, typically `0.08`–`0.18`. |
+| `--branch_frac` | `-1` (auto) | Fraction of StrPr initialised as **branch**. `-1` auto-calibrates via Otsu (capped at 0.15). **This is the one knob that does not always auto-generalise:** on scenes where branches are a small minority Otsu over-estimates and hits the cap, labelling leaves as branch (symptom: high `pred2gt`/`ctr2gt`, false branch cylinders on foliage). Then set it manually — typically `0.03`–`0.18` depending on how branchy the plant is (e.g. newplant5 needs ≈0.05, not the auto 0.15). |
 | `--cluster_size` | `40` | Avg points per StrPr cluster → StrPr **count/granularity**. Smaller = more, finer StrPr (denser scenes can go lower). |
 | `--prune_iso_factor` | `2.5` | Isolation pruning: demote a branch StrPr whose distance to its k-th nearest branch exceeds `median × factor`. **Lower → prune floaters more aggressively** (raise if real thin branches get removed). |
 | `--branch_split_ratio` | `1.5` | Branch densification trigger: split a branch StrPr when its bound AppGS spill `> ratio × cylinder length` along the axis. Lower → split sooner / finer skeleton. |
