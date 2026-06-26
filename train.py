@@ -145,27 +145,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             dis_cylinder = dis_disk = 0
             reg_semantic = torch.tensor(0.0, device=args.device)
 
-        # --- Overlap + size: StrPr should not overlap each other nor be too large ---
-        # Kept as two SEPARATE terms with their own weights (lambda_op / lambda_size). Previously
-        # the size penalty was nested inside loss_op and then multiplied again by lambda_op, so its
-        # effective weight collapsed to lambda_op*lambda_size (=0.025) and the photometric loss
-        # (which pulls StrPr to cover the full appearance) grew them unchecked. They are now added
-        # directly to total_loss below.
+        # --- Overlap regulariser: REMOVED ---
+        # The SuGaR-style overlap loss minimised neighbour overlap by collapsing each Gaussian's
+        # cross-section, which streaked the LEAF StrPr into thin needles (in-plane elongation
+        # 1.8 -> ~185 on some scenes) while leaving the branch Chamfer unchanged. Dropped from the
+        # pipeline; loss_op is kept as a constant 0 only so the tensorboard logging signature is
+        # unchanged. (compute_gaussian_overlap_with_neighbors stays in the model, just unused.)
         loss_op = torch.tensor(0.0, device="cuda")
-        loss_size = torch.tensor(0.0, device="cuda")
-        if args.reg_overlap and iteration > args.overlap_from:
-            strpr.reset_neighbors()
-            # minimise overlap (was 1-overlap, which wrongly ENCOURAGED overlap)
-            loss_op = strpr.compute_gaussian_overlap_with_neighbors(strpr.knn_idx).mean()
-            # Penalise oversized StrPr, but ONLY the cross-section RADIUS (the two SMALLER axes),
-            # NOT the major axis. A branch StrPr is a tube: its long axis IS the branch length and
-            # must stay free for the L1 to elongate it along the branch (penalising max-side scale
-            # crushed exactly this -> aniso 6.0 -> 2.9, tubes collapsed into dots that don't fill the
-            # branch). Penalising the radius keeps tubes thin/non-overlapping while length fills the
-            # branch. Weighted by branch prob so leaf disks stay leaf-sized for appearance.
-            p_branch = strpr.label_activation(strpr.label).squeeze().detach()
-            radius = strpr.get_scaling.sort(dim=1, descending=True).values[:, 1:].mean(dim=1)
-            loss_size = (p_branch * radius).sum() / p_branch.sum().clamp_min(1.0)
 
         # --- Graph (tree continuity / smoothness over the branch MST) ---
         loss_graph = torch.tensor(0.0, device="cuda")
@@ -199,11 +185,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 
         # --- Branch axis alignment: orient each branch StrPr's long axis ALONG the branch ---
         loss_axis = torch.tensor(0.0, device="cuda")
-        if args.reg_axis and iteration > args.overlap_from:
+        if args.reg_axis and iteration > args.densify_from_iter:
             loss_axis = gaussians_pretrain.compute_branch_axis_alignment()
 
         total_loss = (loss + opt.lambda_bind * bind_loss
-                      + opt.lambda_op * loss_op + opt.lambda_size * loss_size
                       + opt.lambda_axis * loss_axis
                       + opt.lambda_graph * loss_graph + opt.lambda_sem * reg_semantic)
         total_loss.backward()
@@ -386,9 +371,6 @@ if __name__ == "__main__":
                         help="iteration after which the MST graph regulariser is active")
     parser.add_argument("--graph_interval", type=int, default=50,
                         help="recompute the (expensive) MST graph loss every N iters")
-    parser.add_argument("--reg_overlap", action="store_true", default=False)
-    parser.add_argument("--overlap_from", type=int, default=500,
-                        help="iteration after which the StrPr overlap+size regulariser is active")
     parser.add_argument("--reg_align", action="store_true", default=False)
     parser.add_argument("--reg_axis", action="store_true", default=False,
                         help="align each branch StrPr's long axis along the local branch direction")
