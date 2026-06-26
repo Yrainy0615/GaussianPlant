@@ -1,28 +1,24 @@
-# GaussianPlant: Structure-Aligned Gaussian Splatting for Plant Structure Extraction
-Yang Yang, Fumio Okura<br>
-| [Webpage](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) | [Full Paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/3d_gaussian_splatting_high.pdf) | <br>
-This repository contains the official authors implementation associated with the paper "GaussianPlant: Structure-Aligned Gaussian Splatting for Plant Structure Extraction", which can be found [here](https://github.com/Yrainy0615/GaussianPlant.git). <br>
+# GaussianPlant: Structure-aligned Gaussian Splatting for 3D Reconstruction of Plants
+Yang Yang, Risa Shinoda, Hiroaki Santo, Fumio Okura<br>
+| [Paper (arXiv:2512.14087)](https://arxiv.org/abs/2512.14087) | <br>
+This repository contains the official authors implementation associated with the paper "GaussianPlant: Structure-aligned Gaussian Splatting for 3D Reconstruction of Plants", which can be found [here](https://github.com/Yrainy0615/GaussianPlant.git). <br>
 <a href="http://cvl.ist.osaka-u.ac.jp/en/"><img height="100" src="assets/osaka_logo.png"> </a>
 
+<p align="center"><img src="configs/teaser_gsplant.svg" width="100%"></p>
 
 Abstract: *We present a method for jointly recovering the appearance and structural organization of plants from multi-view images using 3D Gaussian Splatting (3DGS). While existing 3DGS approaches prioritize appearance fidelity or surface-aligned representations, they do not explicitly capture the underlying structure of objects. Our method introduces structural primitives (StPrs), initialized from clustered SfM points and represented as 3D Gaussians. These StPrs are first optimized to capture the coarse structural form of the plant, after which appearance Gaussians (AppGS) are bound to StPrs and jointly optimized through our proposed optimization strategy. The final plant structure is extracted from the optimized StPrs.
 Our approach enables structure-aware 3DGS without requiring predefined skeleton priors or parametric templates. Experimental results demonstrate that our method effectively reconstructs both appearance and structure of plants, highlighting the potential of 3DGS as a framework for structural information extraction beyond scene representation.*
 
-<section class="section" id="BibTeX">
-  <div class="container is-max-desktop content">
-    <h2 class="title">BibTeX</h2>
-    <pre><code>@Article{kerbl3Dgaussians,
-      author       = {Kerbl, Bernhard and Kopanas, Georgios and Leimk{\"u}hler, Thomas and Drettakis, George},
-      title        = {3D Gaussian Splatting for Real-Time Radiance Field Rendering},
-      journal      = {ACM Transactions on Graphics},
-      number       = {4},
-      volume       = {42},
-      month        = {July},
-      year         = {2023},
-      url          = {https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/}
-}</code></pre>
-  </div>
-</section>
+## BibTeX
+
+```bibtex
+@article{yang2025gaussianplant,
+  title   = {GaussianPlant: Structure-aligned Gaussian Splatting for 3D Reconstruction of Plants},
+  author  = {Yang, Yang and Shinoda, Risa and Santo, Hiroaki and Okura, Fumio},
+  journal = {arXiv preprint arXiv:2512.14087},
+  year    = {2025}
+}
+```
 
 
 ## Cloning the Repository
