@@ -2,22 +2,83 @@
   "version": "0.2.0",
   "configurations": [
       {
-          "name": "Python Debug",
+          "name": "Train Debug",
           "type": "debugpy",
           "request": "launch",
           "program": "${workspaceFolder}/train.py",
           "console": "integratedTerminal",
           "args": [
-              "-s", "data/ficus",
-              "-m", "output/ficus_debug/test",
-              "--gpu", "1",
-              "--port", "6007",
-            //   "--reg_overlap",
-            //   "--reg_align",
-            //   "--reg_mst",
-              // "--start_checkpoint", "7000",
+              "-s", "/mnt/data/newplant1",
+              "-m", "output/newplant1/appgas_nvs/",
+              "--mask_path","masks",
+              // "-d", "depths",
+              "--gpu", "0",
+              "--port", "6010",
+              "--load_iteration", "30000",
+              "--max_strpr_num", "1000",
+              "--reg_bind",
+              // "--reg_graph",
+              // "--reg_align",
+              // "--densify",
           ],
           "justMyCode": true
-      }
-  ]
+      },
+      {
+          "name": "Pretrain Debug",
+          "type": "debugpy",
+          "request": "launch",
+          "program": "${workspaceFolder}/train_3dgs_semantic.py",
+          "console": "integratedTerminal",
+          "args": [
+              "-s", "/mnt/data/newplant3",
+              "-m", "/mnt/data/newplant3/feature_pretrain",
+              "--gpu", "0",
+              "--mask_path", "masks",
+              "--feature_path", "dinov3_dim128",
+              "--port", "6019",              
+              // "-d", "depths",
+              // "--speedup"
+          ],
+          "justMyCode": true
+      },
+
+      {
+        "name": "Render Debug",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/render.py",
+        "console": "integratedTerminal",
+        "args": [
+          "-s", "/mnt/data/plant0",
+          "-m", "output/plant0/feature_pretrain/",
+          "--iteration", "30000", 
+        "--edit_config", "configs/edit_extraction.yaml",
+
+        ],
+        "justMyCode": true
+      },
+            {
+          "name": "export Debug",
+          "type": "debugpy",
+          "request": "launch",
+          "program": "${workspaceFolder}/result_exporter.py",
+          "console": "integratedTerminal",
+          "args": [
+              "-s", "/mnt/data/plant9",
+              "-m", "output/plant9/",
+              "--gpu", "5",
+              "--mask_path", "masks",
+              "--port", "6017",
+              "--strpr_path", "output/plant9/branch/point_cloud/iteration_1000/strpr.ply",
+              "--strpr_branch", "strpr_mask.ply",
+
+              // "--strpr_path", "/mnt/data/plant9/feature_pretrain/point_cloud/iteration_30000/point_cloud.ply",
+              "--pcd_path", "/mnt/data/newplant4/feature_pretrain/point_cloud/iteration_30000/point_cloud_clean.ply",
+              // "--appgas_path", "/mnt/data/newplant10/feature_pretrain/point_cloud/iteration_30000/point_cloud_branch.ply",
+              // "-d", "depths",
+
+          ],
+          "justMyCode": true
+      },
+    ]
 }

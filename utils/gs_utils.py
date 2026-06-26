@@ -10,200 +10,30 @@ from sklearn.decomposition import PCA
 from scipy.spatial.transform import Rotation as R
 from matplotlib.patches import Ellipse
 from typing import Literal
-from pytorch3d.transforms import quaternion_to_matrix
+from utils.pytorch3d_compat import quaternion_to_matrix, matrix_to_quaternion
 import torch
 import torch.nn.functional as F
 from plyfile import PlyData, PlyElement
 from scipy.spatial import cKDTree
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import minimum_spanning_tree
+import pyvista as pv
+import os
 
-def estimate_laplacian(pcd, radius=0.1):
-    # 计算点云的邻域
-    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-    points = np.asarray(pcd.points)
-    n_points = len(points)
-    
-    # 构建拉普拉斯矩阵 L
-    rows = []
-    cols = []
-    data = []
-    
-    for i in range(n_points):
-        [k, idx, _] = pcd_tree.search_radius_vector_3d(points[i], radius)
-        k_neighbors = len(idx)  # 包括自身
-        for j in range(k_neighbors):
-            rows.append(i)
-            cols.append(idx[j])
-            data.append(-1.0)
-        rows.append(i)
-        cols.append(i)
-        data.append(k_neighbors - 1)
-    
-    L = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(n_points, n_points))
-    return L
-
-def laplacian_contraction(pcd, num_iterations=20, radius=0.1, lambda_L=0.5, lambda_H=1.0):
-    points = np.asarray(pcd.points)
-    n_points = len(points)
-
-    # 初始化收缩权重
-    W_L = np.eye(n_points) * lambda_L
-    W_H = np.eye(n_points) * lambda_H
-    
-    # 迭代收缩过程
-    for t in range(num_iterations):
-        L = estimate_laplacian(pcd, radius)
-        
-        # 计算 P^{t+1}
-        rhs = np.zeros((n_points, 3))
-        rhs[:, :] = np.dot(W_H, points)
-        
-        lhs = np.vstack([np.zeros((1, 3)), np.dot(W_L, L)])
-        
-        # 解线性系统 P^{t+1} = inv(lhs) * rhs
-        new_points = scipy.sparse.linalg.spsolve(lhs, rhs)
-        
-        points = new_points
-        pcd.points = o3d.utility.Vector3dVector(points)
-    
-    return pcd
-
-def don_pointcloud_gs(gaussians,radius1, radius2):
+def save_labeled_points(points, label,save_path):
     """
-    Estimate normals of a point cloud
-    radius: number of neighbors to consider
+    Save labeled points to a file.
+    Args:
+        points: (N, 3) numpy array of point coordinates
+        label: (N,) numpy array of labels
     """
-    nn = gaussians.knn_idx
-    normals = gaussians.get_smallest_axis()
-    neighbors = nn[:, 1:]
-    normals_neighbor = normals[neighbors]
-    normals_r1 = normals_neighbor[:, 1:radius1,:].mean(dim=-1)
-    normals_r2 = normals_neighbor[:, radius1:radius2,:].mean(dim=-1)
-    return 0.5 * (normals_r1 - normals_r2)
-
-def don_pointcloud(points,radius1=0.0001, radius2=0.001, knn1=10, knn2=100, method='radius'):
-    # difference of normals operator
-    # use open3d to compute normals
-    if method == 'knn':
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy())
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn1))
-        normals_r1 = np.asarray(pcd.normals).copy()
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn2))
-        normals_r2 = np.asarray(pcd.normals)
-    elif method == 'radius':
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy())
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamRadius(radius=radius1))
-        normals_r1 = np.asarray(pcd.normals).copy()
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamRadius(radius=radius2))
-        normals_r2 = np.asarray(pcd.normals)
-    else:
-        raise ValueError("Method not supported")
-    result = 0.5 * (normals_r1 - normals_r2)
-    norm_diff = np.linalg.norm(result, axis=1)
-    return norm_diff
-
-def don_func(gaussian,radius1, radius2,threshold, knn1,knn2,method='radius',vis_don_pointcloud=False):
-    # split leaf and branch  based on point cloud
-    xyz = gaussian._xyz.detach().cpu().numpy()
-    don = don_pointcloud(gaussian, radius1=radius1,radius2=radius2,knn1=10,knn2=1000,method=method)
-    points_branch = xyz[don >threshold]
-    points_leaf = xyz[don <threshold]
-    # save branch points
-    pcd_branch = o3d.geometry.PointCloud()
-    pcd_branch.points = o3d.utility.Vector3dVector(points_branch)
-    pcd_leaf = o3d.geometry.PointCloud()
-    pcd_leaf.points = o3d.utility.Vector3dVector(points_leaf)
-    
-    # save don colored point cloud 
+    assert points.shape[0] == label.shape[0], "Points and labels must have the same number of elements."
+    colors = np.random.rand(len(np.unique(label)), 3)  # Random colors for each label
+    point_colors = np.array([colors[l] if l != -1 else [0.8,0.8,0.8] for l in label])
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz)
-
-    # color by don
-    norm_don = (don - don.min()) / (don.max() - don.min())
-    colors = cm.viridis(norm_don)[:, :3]  # 使用 matplotlib colormap
-    if vis_don_pointcloud:
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(xyz)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-        o3d.io.write_point_cloud(f"don_colored_{radius1}_{radius2}.ply", pcd)
-        o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/branch.ply", pcd_branch)
-        o3d.io.write_point_cloud("output/ficus/max_5000/point_cloud/iteration_7000/leaf.ply", pcd_leaf)
-
-def fit_cylinder_ransac(points,  eps=0.005,min_samples=5,save_ply=False): 
-    from sklearn.cluster import DBSCAN
-
-    # Dummy logic: let's just run DBSCAN to group roughly linear segments (can be seen as 'branches')
-    # (0.03,5) for plant4 | (0.005,5) for ficus
-
-    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(points) # 0.005,5
-    labels = clustering.labels_
-    
-    # Assign color by label
-    colors = np.random.rand(len(set(labels)), 3)
-    point_colors = np.array([colors[l] if l != -1 else [0.8, 0.8, 0.8] for l in labels])
-
-    # Save to PLY
-    if save_ply:
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-        pcd.colors = o3d.utility.Vector3dVector(point_colors)
-        o3d.io.write_point_cloud("dbscan_segmentation_ficus.ply", pcd)
-        print("Saved: dbscan_segmentation.ply")
-    
-    # add leaf branch filter
-    leaf_color = [0.0, 1.0, 0.0]     # green
-    branch_color = [1.0, 0.0, 0.0]   # red
-    noise_color = [0.7, 0.7, 0.7]    # gray
-    unique_labels = set(labels)
-    label_leaf = []
-    label_branch = []
-    for label in unique_labels:
-        if label == -1:
-            # Noise
-            point_colors[labels == label] = noise_color
-            continue
-
-        cluster_points = points[labels == label]
-
-        if len(cluster_points) < 100:
-            point_colors[labels == label] = noise_color
-            continue
-
-        if is_leaf(cluster_points):
-            point_colors[labels == label] = leaf_color
-            label_leaf.append(label)
-        else:
-            point_colors[labels == label] = branch_color
-            label_branch.append(label)
-    if save_ply:
-        pcd.colors = o3d.utility.Vector3dVector(point_colors)
-        o3d.io.write_point_cloud("dbscan_segment_leaf_branch_ficus.ply", pcd)
-    # return three labels
-    return label_leaf, label_branch, labels
-
-def z_axis_to_vector_rotation(target_vector,target: Literal['gs', 'cylinder']):
-    """Compute rotation that aligns [0, 0, 1] to target_vector"""
-    target_vector = target_vector / np.linalg.norm(target_vector)
-    if target == 'gs':
-        z_axis = np.array([1, 0, 0])
-    elif target == 'cylinder':
-        z_axis = np.array([0, 0, 1])
-    else:
-        raise ValueError("target must be 'gs' or 'cylinder'")
-    v = np.cross(z_axis, target_vector)
-    c = np.dot(z_axis, target_vector)
-    if np.isclose(c, 1.0):  # Already aligned
-        return np.eye(3)
-    if np.isclose(c, -1.0):  # Opposite
-        return R.from_rotvec(np.pi * np.array([1, 0, 0])).as_matrix()
-    vx = np.array([[0, -v[2], v[1]],
-                   [v[2], 0, -v[0]],
-                   [-v[1], v[0], 0]])
-    rot_matrix = np.eye(3) + vx + vx @ vx * (1 / (1 + c))
-    return rot_matrix
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(point_colors)
+    o3d.io.write_point_cloud(os.path.join(save_path,"labeled_points.ply"), pcd)
 
 def z_axis_to_vector_rotation_torch(target_vector: torch.Tensor, target: str = 'cylinder') -> torch.Tensor:
     """
@@ -246,424 +76,608 @@ def z_axis_to_vector_rotation_torch(target_vector: torch.Tensor, target: str = '
     rot_matrix = torch.eye(3, dtype=target_vector.dtype, device=target_vector.device) + vx + vx @ vx * (1 / (1 + c))
     return rot_matrix
 
-def estimate_gs_para_from_cluster(xyz,test_flag=False):
-    cov = np.cov(xyz.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    # width = 3 * np.sqrt(eigvals[0])
-    # height = 3 * np.sqrt(eigvals[1])
-    width = 3 * np.sqrt(eigvals[1])
-    height = 3 * np.sqrt(eigvals[0])
-    idx = eigvals.argsort()[::-1]
+def align_z_axis_to_vector(target_vec: torch.Tensor) -> torch.Tensor:
+    z_axis = torch.tensor([0.0, 0.0, 1.0], device=target_vec.device)
+    v = torch.cross(z_axis, target_vec)
+    c = torch.dot(z_axis, target_vec)
+    s = torch.norm(v)
+
+    if s < 1e-6:
+        return torch.eye(3, device=target_vec.device)
+
+    vx = torch.tensor([
+        [0, -v[2], v[1]],
+        [v[2], 0, -v[0]],
+        [-v[1], v[0], 0]
+    ], device=target_vec.device)
+
+    R = torch.eye(3, device=target_vec.device) + vx + vx @ vx * ((1 - c) / (s**2 + 1e-8))
+    return R
+
+def estimate_gs_para_from_cluster(xyz: torch.Tensor, anisotropy_threshold: float=3.0, device='cuda'):
+    """
+    Estimate Gaussian parameters (center, rotation, scale) from a point cluster using PCA.
+    Input:
+        xyz: (N, 3) torch tensor
+    Returns:
+        center: (3,) mean of points
+        rot_gs: (4,) quaternion [w, x, y, z]
+        scale: (3,) sqrt of eigenvalues (clipped)
+    """
+    xyz = xyz.to(device)
+    center = xyz.mean(dim=0)  # (3,)
+    cov = torch.cov(xyz.T)  # (3, 3)
+
+    # Eigen decomposition
+    eigvals, eigvecs = torch.linalg.eigh(cov)
+    idx = torch.argsort(eigvals, descending=True)
     eigvals = eigvals[idx]
     eigvecs = eigvecs[:, idx]
-    center = np.mean(xyz, axis=0)    
+
     major_axis = eigvecs[:, 0]
-    minor_axis = eigvecs[:, 1]
     normal = eigvecs[:, 2]
-    # rot_gs = np.roll(rot_gs,1)
-    rot_matrix_cylinder = z_axis_to_vector_rotation(major_axis,target='cylinder') 
-    rot_matrix_gs = z_axis_to_vector_rotation(major_axis, target='gs')
-    # rot_matrix_disk = z_axis_to_vector_rotation(normal, target='cylinder')
-    rot_matrix_disk = eigvecs
-    rot_gs = R.from_matrix(rot_matrix_gs).as_quat()
-    rot_gs = np.roll(rot_gs, 1)  # [x,y,z,w] - > [w,x,y,z]
 
-    # for cylinder main axis
-    scale = np.sqrt(eigvals).clip(min=0.01)
-    if test_flag:
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
-        ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], s=5, alpha=0.6)
-        length =0.1
-        ax.quiver(center[0], center[1], center[2], major_axis[0], major_axis[1], major_axis[2], length=length, color='r', label='Major Axis')
-        ax.quiver(center[0], center[1], center[2], minor_axis[0], minor_axis[1], minor_axis[2], length=length, color='g', label='Minor Axis')
-        ax.quiver(center[0], center[1], center[2], normal[0], normal[1], normal[2], length=length, color='b', label='Normal')
-        ax.set_title("PCA Eigenvectors")
-        ax.legend()
-        plt.show()
-    return center,rot_gs,scale, rot_matrix_cylinder,rot_matrix_disk
+    # Rotation matrices
+    rot_matrix_cylinder = align_z_axis_to_vector(major_axis)
+    rot_matrix_disk = align_z_axis_to_vector(normal)
+    rot_matrix = eigvecs # local frame from PCA
 
-def branch_to_cylinder(branch_points,branch_positions,branch_scales, branch_rotations,filename="cylinder_branch_init.ply",save_flag=False):
-    cylinder_meshes = []
+    # Convert matrix to quaternion [w, x, y, z]
+    rot_gs = matrix_to_quaternion(rot_matrix[None])[0]  # (4,)
+    scale = torch.sqrt(eigvals)
+    
+    
+    # leaf/branch prior
+    anisotropy = scale[0] / scale[1]
+    if anisotropy < anisotropy_threshold:
+        prior = torch.tensor(0.2, device=xyz.device)  # leaf prior
+    else:
+        prior = torch.tensor(0.8, device=xyz.device)  # branch prior
+    return center, rot_gs, scale,  anisotropy,rot_matrix_cylinder,rot_matrix_disk
+       
 
-    for pos, scale, rot_matrix in zip(branch_positions, branch_scales, branch_rotations):
-        # 默认方向：cylinder 沿 z 轴生成
-        # height = np.sqrt(scale[0]) * 2  # 主轴长度为 height
-        # radius = np.sqrt(scale[1]) * 2  # 横截面尺寸，可以调整
-        height = 3*scale[0]
-        radius = scale[1]
-        cylinder = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=height, resolution=20, split=4)
-        # R,t
-        # rot_matrix = R.from_quat(quat).as_matrix()
-        cylinder.rotate(rot_matrix, center=(0, 0, 0))
-        cylinder.translate(pos, relative=False)
-        cylinder.paint_uniform_color([0.6, 0.3, 0.0])  # 木头色（棕色）
+def strpr_to_cylinder(pos, S,  R, iteration, create_mesh=False, save_path = 'output',resolution=32):
+    """
+    Convert structural primitives (StrPrs) to cylinder surfaces for branch modeling.
+    issue with rotation rebuild, a right version is directly using the rotation_cylinder -> main_axis = rot_matrix[:,:,2] -> R_align = align_z_axis_to_vector(main_axis[i]) ->mesh rotate(_torch_to_numpy(R_align), center=(0, 0, 0))
 
-        cylinder_meshes.append(cylinder)
-    # 合并所有 mesh 并保存
-    mesh_all = o3d.geometry.TriangleMesh()
-    for m in cylinder_meshes:
-        mesh_all += m
-    # add branch points
-    branch_pcd = o3d.geometry.PointCloud()
-    branch_pcd.points = o3d.utility.Vector3dVector(branch_points)
-    branch_pcd.paint_uniform_color([1.0, 1.0, 0.0]) 
-    if save_flag:
-        o3d.io.write_triangle_mesh(filename, mesh_all)
-        o3d.io.write_point_cloud("branch_points.ply", branch_pcd)
-        print(f"[✓] Saved {filename} with {len(branch_positions)} cylinders.")
-    return cylinder_meshes
+    Args:
+        p: (N, 3) positions
+        S: (N, 2) scaling — assuming S[:,0]=height, S[:,1]=radius for 2DGS
+        R: (N, 3,3) rotation matrix
+    Returns:
+        dict of geometric params, mesh_all, mesh_list
+    """
 
-def convert_gs_rot_to_cylinder(rot_gs_quat):
-    R_gs = quaternion_to_matrix(rot_gs_quat)
-    major_axis = R_gs[:, 0]
-    rot_cylinder = z_axis_to_vector_rotation_torch(major_axis, target='cylinder')
-    return rot_cylinder
+    rot_matrix = R# Convert quaternion to rotation matrix
 
-def convert_gs_rot_to_disk(rot_gs_quat):
-    R_gs = quaternion_to_matrix(rot_gs_quat)
-    normal_axis = R_gs[:, 2]
-    rot_disk = z_axis_to_vector_rotation_torch(normal_axis, target='cylinder')
-    return rot_disk
-        
-
-def leaf_to_disk(leaf_positions, leaf_scales, leaf_rotations, filename="leaf_disk_init.ply",resolution=50,save_flag=False):
-    leaf_disk = []
-    for center, scale, rot_matrix in zip(leaf_positions, leaf_scales, leaf_rotations):
-        a = 2 * scale[0]
-        b =   scale[1]
-        theta = np.linspace(0, 2 * np.pi, resolution)
-        x = a * np.cos(theta)
-        y = b * np.sin(theta)
-        z = np.zeros_like(x)
-        ellipse_points = np.stack([x, y, z], axis=1)  # (N, 3)
-        vertices = []
-        triangles = []
-        vertices.append([0, 0, 0])  
-        for pt in ellipse_points:
-            vertices.append(pt.tolist())
-        for i in range(1, resolution):
-            triangles.append([0, i, i + 1])
-        triangles.append([0, resolution, 1])  # wrap around
-        vertices = np.array(vertices)
-        vertices = vertices @ rot_matrix.T
-        vertices += center  # 平移
-
-        # build mesh
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(vertices)
-        mesh.triangles = o3d.utility.Vector3iVector(triangles)
-        mesh.compute_vertex_normals()
-        mesh.paint_uniform_color([0.0, 0.8, 0.0])  # 绿色叶片
-        leaf_disk.append(mesh)
-
-    if save_flag:
-        mesh_all = o3d.geometry.TriangleMesh()
-        for m in leaf_disk:
-            mesh_all += m
-        o3d.io.write_triangle_mesh(filename, mesh_all)
-    print(f"[✓] Saved {filename} with {len(leaf_disk)} disks.")
-    return leaf_disk
-
-def leaf_to_disk_param(stpr_pos,stpr_scales,stpr_rots,convert_mesh=False):
-    centers = stpr_pos
-    axes_x = 2*stpr_scales[:,0]
-    axes_y = stpr_scales[:,1]
-    rot_disk = convert_gs_rot_to_disk(stpr_rots)
-    leaf_disk_param = {
-        'centers': centers,
-        'axes_x': axes_x,
-        'axes_y': axes_y,
-        'rot_matrix': rot_disk
+    r = S[:, 2]      # radius = smallest scale (the true branch thickness; ×3 over-fattened
+                     # the tube so it captured leaves' planar spread -> branch-bias in binding)
+    h = 3 * S[:, 0]  # height
+    main_axis = rot_matrix[:,:,0] # z-axis of the cylinder 2 for rot_cylinder
+    cylinder_params ={
+        'pos': pos,
+        'radius': r,
+        'height': h,
+        'axis_vec': main_axis,
     }
-    if convert_mesh:
-        cemter_np = centers.detach().cpu().numpy()
-        scale_np = stpr_scales.detach().cpu().numpy()
-        rot_matrix_np = rot_disk.detach().cpu().numpy()
-        leaf_disks= leaf_to_disk(cemter_np, scale_np, rot_matrix_np, filename="leaf_disk_vis.ply",resolution=50,save_flag=True)
-    return leaf_disk_param,leaf_disks
+    if create_mesh:
+        # Save the cylinder parameters
+        mesh_all = o3d.geometry.TriangleMesh()
+        mesh_list = []
+        for i in range(len(pos)):
+            mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=r[i], height=h[i], resolution=resolution, split=20)
+            R_align = align_z_axis_to_vector(main_axis[i])  # (3, 3)
+            mesh.rotate(_torch_to_numpy(R_align), center=(0, 0, 0))
+            mesh.translate(_torch_to_numpy(pos[i]))
+            mesh_list.append(mesh)
+            mesh_all += mesh
+        o3d.io.write_triangle_mesh(save_path, mesh_all)
+        return cylinder_params, mesh_all, mesh_list
+    else:
+        return cylinder_params, None, None
 
-def gs_to_cylinder_distance(
-        xyz: torch.Tensor,                  # (M,3) appGs 位置
-        parent: torch.LongTensor,           # (M,)  属于哪个 StPr
-        cyl_param  # 'center','axis','radius','half_len'
-) -> torch.Tensor:                          # 返回 (M,) 距离
-    C = cyl_param['center'][parent]         # (M,3)
-    u = cyl_param['axis'][parent]           # (M,3) 已归一化
-    r = cyl_param['radius'][parent]         # (M,)
-    h = cyl_param['half_len'][parent]       # (M,)
-    C = C.squeeze(1)  
-    u = u.squeeze(1)  
-    v   = xyz - C                           # (M,3)
-    t   = torch.sum(v * u, dim=-1)          # 投影到轴坐标
-    t_c = torch.clamp(t.unsqueeze(1), -h, h)             # 夹到端盖内
-    P_a = C + t_c * u         # 轴上最近点
-    d_side = torch.norm(xyz - P_a, dim=-1).unsqueeze(1) - r
-    d_side = torch.clamp(d_side, min=0.0)   # 侧壁距离 (负值→0)
+def strpr_to_disk(pos, S, R, iteration,resolution=50, create_mesh=False,save_path='output'):
+    rot_matrix = R
+    u = rot_matrix[:, :, 0]  # disk x-axis (major)
+    v = rot_matrix[:, :, 1]  # disk y-axis (minor)
+    n = rot_matrix[:, :, 2]  # disk normal
+    a = 2 * S[:, 0]  # major axis radius
+    b =     S[:, 1]  # minor axis radius
+    disk_params = {'center': pos, 'a': a, 'b': b, 'u': u, 'v': v, 'n': n}
+    if not create_mesh:
+        return disk_params, None, None
 
-    # 端盖外侧的距离
-    cap_mask = (t.abs().unsqueeze(1) > h)
-    d_cap = torch.sqrt(
-        d_side[cap_mask]**2 + (t.abs().unsqueeze(1)[cap_mask]-h[cap_mask])**2
-    )
-    d_side[cap_mask] = d_cap
-    return d_side                           # (M,)
+    mesh_all = o3d.geometry.TriangleMesh()
+    mesh_all_list = []
 
+    theta = torch.linspace(0, 2 * torch.pi, steps=resolution + 1, device=pos.device)[:-1]
+    cos_t = torch.cos(theta)  # (res,)
+    sin_t = torch.sin(theta)  # (res,)
 
-# ────────────────────────────────────────────────────────────
-# 2. GS ↔ Elliptic Disk 距离
-# ─────────────────────────────────────────────────────────────
-def gs_to_disk_distance(
-        xyz: torch.Tensor,                 # (M,3)
-        parent: torch.LongTensor,          # (M,)
-        disk_param# 'center','normal','a','b'
-) -> torch.Tensor:                         # (M,)
-    C = disk_param['center'][parent].squeeze(1)      # (M,3)
-    n = disk_param['normal'][parent] 
-    a = disk_param['a'][parent]            # (M,)
-    b = disk_param['b'][parent]            # (M,)
+    for i in range(pos.shape[0]):
+        x = a[i] * cos_t  # (res,)
+        y = b[i] * sin_t  # (res,)
+        verts_ring = pos[i] + x.unsqueeze(1) * u[i] + y.unsqueeze(1) * v[i]  # (res, 3)
+        verts = torch.cat([pos[i].unsqueeze(0), verts_ring], dim=0)  # (res+1, 3)
+
+        # Fan triangulation
+        tri_idx = torch.stack([
+            torch.zeros(resolution, dtype=torch.long, device=pos.device),
+            (torch.arange(1, resolution + 1, device=pos.device) % resolution) + 1,
+            torch.arange(1, resolution + 1, device=pos.device)
+        ], dim=1)
+
+        # Build Open3D mesh
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts.detach().cpu().numpy())
+        mesh.triangles = o3d.utility.Vector3iVector(tri_idx.detach().cpu().numpy())
+        mesh_all_list.append(mesh)
+        mesh_all += mesh
+    o3d.io.write_triangle_mesh(save_path, mesh_all)
+    return disk_params, mesh_all, mesh_all_list
+
+def gs_to_cylinder_distance(xyz, nn, cylinder_params):
+    """
+    Compute the distance from points to cylinder surfaces.
+    Args:
+        xyz: (N, 3) torch tensor of point coordinates
+        nn: (N, 3) correspondence between points and cylinder 
+        cylinder_params: dict with keys 'pos', 'radius', 'height', 'axis_vec'
+    Returns:
+        dist: (N,) torch tensor of distances to cylinder surfaces
+    """
+    C = cylinder_params['pos'][nn]    # (M,3)
+    u = cylinder_params['axis_vec'][nn]      # (M,3) normalized
+    r = cylinder_params['radius'][nn]               # (M,)
+    h = cylinder_params['height'][nn]             # (M,)
+    xyz = xyz.to(C.device)  # Ensure xyz is on the same device as C
     v = xyz - C
-    d_plane = torch.abs(torch.sum(v * n, dim=-1))           # |z|
+    t = torch.sum(v * u, dim=-1)                  # projection
+    t_c = torch.clamp(t, -h, h)
+    P_a = C + t_c.unsqueeze(1) * u                # nearest on axis
 
-    # 构平面的局部坐标基 e1,e2
+    d_axis = torch.norm(xyz - P_a, dim=-1)        # radial distance
+    d_side = torch.abs(d_axis - r)                # penalize inside & outside
+
+    cap_mask = (t.abs() > h)
+    if cap_mask.any():
+        d_cap = torch.sqrt(
+            (d_side[cap_mask])**2 + (t[cap_mask].abs() - h[cap_mask])**2
+        )
+        d_side[cap_mask] = d_cap
+    return d_side
+
+def gs_to_disk_distance(xyz, parent, disk_param):
+    C = disk_param['center'][parent]
+    n = disk_param['n'][parent]
+    a = disk_param['a'][parent]
+    b = disk_param['b'][parent]
+    xyz = xyz.to(C.device)  # Ensure xyz is on the same device as C
+    v = xyz - C
+    d_plane = torch.abs(torch.sum(v * n, dim=-1))
+
     tmp = torch.tensor([1.,0.,0.], device=xyz.device).expand_as(n)
     e1 = F.normalize(torch.cross(n, tmp), dim=-1)
-    # 当 n≈x 轴时，用 y 轴生成
     bad = torch.isnan(e1).any(dim=-1)
     if bad.any():
         tmp2 = torch.tensor([0.,1.,0.], device=xyz.device).expand_as(n[bad])
         e1[bad] = F.normalize(torch.cross(n[bad], tmp2), dim=-1)
     e2 = torch.cross(n, e1)
 
-    # 坐标 (x',y') in disk plane
     x_coord = torch.sum(v * e1, dim=-1)
     y_coord = torch.sum(v * e2, dim=-1)
 
-    r_val = torch.sqrt((x_coord/a)**2 + (y_coord/b)**2)     # 椭圆极半径
-    # 到椭圆边的径向距离
-    d_edge = torch.sqrt( (x_coord - a*r_val.reciprocal())**2 +
-                         (y_coord - b*r_val.reciprocal())**2 )
+    eps = 1e-6
+    r_val = torch.sqrt((x_coord / (a + eps))**2 + (y_coord / (b + eps))**2)
 
-    d = torch.where(r_val <= 1.0,
-                    d_plane,
-                    torch.sqrt(d_plane**2 + d_edge**2))
+    x_ellipse = (x_coord / r_val.clamp(min=eps)) * a
+    y_ellipse = (y_coord / r_val.clamp(min=eps)) * b
+    d_edge = torch.sqrt((x_coord - x_ellipse)**2 + (y_coord - y_ellipse)**2)
+
+    d = torch.where(r_val <= 1.0, d_plane, torch.sqrt(d_plane**2 + d_edge**2))
     return d
 
-def is_leaf(points, flatness_thresh=0.1, anisotropy_thresh=0.95): # 0.1, 0.8
-    # record the anisotropy and flatness
-    pca = PCA(n_components=3)
-    pca.fit(points)
-    eigvals = pca.explained_variance_
-
-    # flatness ratio: z-direction variance vs major axis
-    flatness = eigvals[2] / (eigvals[0] + 1e-6)
-    anisotropy = (eigvals[0] - eigvals[1]) / (eigvals[0] + 1e-6)
-    # print(f"Anisotropy: {anisotropy}, Flatness: {flatness}")
-    
-    if anisotropy < anisotropy_thresh : # and flatness < flatness_thresh
-        return True # leaf-like
-    return False    # branch-like
 
 def _torch_to_numpy(x: torch.Tensor):
     return x.detach().cpu().numpy()
 
-def align_Z_to_u(u: torch.Tensor) -> torch.Tensor:
-    """
-    输入单位向量 u (…,3)，返回 3×3 旋转矩阵，把局部 (0,0,1) 转到 u。
-    """
-    z = torch.tensor([0.,0.,1.], device=u.device, dtype=u.dtype)
-    v = torch.cross(z, u)
-    c = torch.sum(z * u, dim=-1, keepdim=True)        # cosθ
-    s = torch.norm(v, dim=-1, keepdim=True)           # sinθ
-    # R = I + [v]_x + [v]_x^2 * ((1-c)/s^2)
-    vx = torch.zeros(u.shape[:-1] + (3,3), device=u.device, dtype=u.dtype)
-    vx[..., 0,1], vx[..., 0,2] = -v[...,2],  v[...,1]
-    vx[..., 1,0], vx[..., 1,2] =  v[...,2], -v[...,0]
-    vx[..., 2,0], vx[..., 2,1] = -v[...,1],  v[...,0]
-    eye = torch.eye(3, device=u.device, dtype=u.dtype).expand_as(vx)
-    R = eye + vx + vx @ vx * ((1-c)/ (s**2 + 1e-8))
-    # 当 u≈±z 时，v≈0，算法退化；手动处理：
-    parallel = s.squeeze(-1) < 1e-6
-    R[parallel & (c.squeeze(-1) > 0)] = eye[0]        # 同向: I
-    R[parallel & (c.squeeze(-1) < 0)] = torch.diag(torch.tensor([1,-1,-1],device=u.device,dtype=u.dtype)) # 反向: 180°绕X
-    return R
 
-def stpr_to_cylinder(p, S, R,save_flag=True,resolution=32):
-    rot_matrix = quaternion_to_matrix(R)  # (N,3,3)
-    r = S[:,1]   # (N,)
-    h = 3* S[:, 0]                        # 半长 (从中心到端盖)
-    u_save = rot_matrix[:, :, 2]                     # 轴向单位向量 (N,3)
+# def build_mst_from_endpoints(top, bottom, k:int=3):
+#     top = top.detach().cpu().numpy()
+#     bottom = bottom.detach().cpu().numpy()
+#     N = top.shape[0]
+#     points = np.empty((2*N, 3), dtype=np.float32)
+#     points[0::2] = top
+#     points[1::2] = bottom    
+#     M = points.shape[0]
+#     row, col, data = [], [], []
 
-    if save_flag:
-        mesh_all = o3d.geometry.TriangleMesh()
-        for i in range(p.shape[0]):
-            mesh = o3d.geometry.TriangleMesh.create_cylinder(
-                radius=float(r[i]), height=float(h[i]),
-                resolution=resolution, split=20)
-            u = rot_matrix[i,:,0]                            # 目标主轴
-            R_align = align_Z_to_u(u)
-            mesh.rotate(_torch_to_numpy(R_align), center=(0, 0, 0))
-            mesh.translate(_torch_to_numpy(p[i]))
-            mesh_all = mesh_all + mesh
-        #o3d.io.write_triangle_mesh(f'branch_cylinder_vis.ply', mesh_all)
-        return {'center': p, 'axis': u_save, 'radius': r, 'half_len': h}, mesh_all
-    else:
-        return {'center': p, 'axis': u_save, 'radius': r, 'half_len': h}, None
+#     # (1)  zero‑weight internal edges
+#     idx = np.arange(N, dtype=np.int32)
+#     row.extend(2*idx)           ; col.extend(2*idx+1)
+#     data.extend(np.zeros(N))    # weight 0
+#     #  symmetric entry
+#     row.extend(2*idx+1)         ; col.extend(2*idx)
+#     data.extend(np.zeros(N))
 
-def stpr_to_disk(p, S, R, save_flag=False,resolution=32):
-    rot_matrix = quaternion_to_matrix(R)  # (N,3,3)
-    a = 2 * S[:, 0]
-    b = S[:, 1]   # (N,)
-    u,v,n = rot_matrix[:, :, 0], rot_matrix[:, :, 1], rot_matrix[:, :, 2] 
-    if save_flag:
-        mesh_all = o3d.geometry.TriangleMesh()
-        # 预生成圆周角度 (CPU 张量即可)
-        theta = torch.linspace(0, 2*torch.pi, steps=resolution+1)[:-1]  # (R,)
-        cos_t, sin_t = torch.cos(theta), torch.sin(theta)               # (R,)
+#     # (2)  k‑NN edges  (Euclidean distance)
+#     tree = cKDTree(points)
+#     dists, neigh = tree.query(points, k=k+1)     # first neighbour is itself
 
-        for i in range(p.shape[0]):
-            # 3.1 椭圆周圈顶点 (R,3)
-            x = a[i] * cos_t.to(a.device)                         
-            y = b[i] * sin_t.to(a.device)                        
-            verts_ring = (p[i]                                          
-                          + x.unsqueeze(1) * u[i]                        
-                          + y.unsqueeze(1) * v[i])                      
+#     for i in range(M):
+#         for j, d in zip(neigh[i, 1:], dists[i, 1:]):   # skip self
+#             row.append(i);  col.append(j);  data.append(d)
+#             # symmetric entry
+#             row.append(j);  col.append(i);  data.append(d)
 
-            # 3.2 顶点堆叠 + fan triangulation
-            verts = torch.cat([p[i].unsqueeze(0), verts_ring], dim=0)    # (R+1,3)
-            tri_idx = torch.stack([                                       # (R,3)
-                torch.zeros(resolution, dtype=torch.int64, device=p.device),       # center idx 0
-                torch.arange(1, resolution+1, device=p.device) % resolution + 1,
-                torch.arange(1, resolution+1, device=p.device)
-            ], dim=1)
+#     # ---------- build symmetric CSR adjacency ----------
+#     A = csr_matrix((data, (row, col)), shape=(M, M))
 
-            # 3.3 转成 Open3D Mesh
-            mesh = o3d.geometry.TriangleMesh()
-            mesh.vertices  = o3d.utility.Vector3dVector(_torch_to_numpy(verts))
-            mesh.triangles = o3d.utility.Vector3iVector(_torch_to_numpy(tri_idx))
-            mesh.compute_vertex_normals()
-
-            mesh_all += mesh
-        #TODO: fix rotation bug
-        o3d.io.write_triangle_mesh('leaf_disk_vis.ply', mesh_all)
-    return {'center': p, 'normal': u, 'a': a, 'b': b}
-
-def build_edge(top, bottom,save_edge=False):
-        # save a mesh of edge
-        N = top.size(0)
-        verts = torch.empty((2*N, 3), dtype=torch.float32, device=top.device)
-        verts[0::2] = top
-        verts[1::2] = bottom
-        verts_np = verts.detach().cpu().numpy()
-        edges_np = np.arange(2*N, dtype=np.int32).reshape(-1, 2)
-        ls = o3d.geometry.LineSet()
-        ls.points = o3d.utility.Vector3dVector(verts_np)
-        ls.lines  = o3d.utility.Vector2iVector(edges_np)
-        idx = torch.arange(N, dtype=torch.long, device=top.device)
-
-
-        # ---------- 3‑B  optional: save PLY with vertex+edge -------------------
-        if save_edge:
-            v_struct = np.empty(2*N, dtype=[('x','f4'),('y','f4'),('z','f4')])
-            v_struct['x'], v_struct['y'], v_struct['z'] = verts_np.T
-            el_v = PlyElement.describe(v_struct, 'vertex')
-
-            e_struct = np.empty(N, dtype=[('vertex1','u4'),('vertex2','u4')])
-            e_struct['vertex1'] = edges_np[:,0]
-            e_struct['vertex2'] = edges_np[:,1]
-            el_e = PlyElement.describe(e_struct, 'edge')
-
-            PlyData([el_v, el_e], text=True).write('edge.ply')
-        return verts, 2*idx, 2*idx +1
-
-def build_mst_from_endpoints(top, bottom, k:int=16):
-    top = top.detach().cpu().numpy()
-    bottom = bottom.detach().cpu().numpy()
-    N = top.shape[0]
-    points = np.empty((2*N, 3), dtype=np.float32)
-    points[0::2] = top
-    points[1::2] = bottom    
-    M = points.shape[0]
-    row, col, data = [], [], []
-
-    # (1)  zero‑weight internal edges
-    idx = np.arange(N, dtype=np.int32)
-    row.extend(2*idx)           ; col.extend(2*idx+1)
-    data.extend(np.zeros(N))    # weight 0
-    #  symmetric entry
-    row.extend(2*idx+1)         ; col.extend(2*idx)
-    data.extend(np.zeros(N))
-
-    # (2)  k‑NN edges  (Euclidean distance)
-    tree = cKDTree(points)
-    dists, neigh = tree.query(points, k=k+1)     # first neighbour is itself
-
-    for i in range(M):
-        for j, d in zip(neigh[i, 1:], dists[i, 1:]):   # skip self
-            row.append(i);  col.append(j);  data.append(d)
-            # symmetric entry
-            row.append(j);  col.append(i);  data.append(d)
-
-    # ---------- build symmetric CSR adjacency ----------
-    A = csr_matrix((data, (row, col)), shape=(M, M))
-
-    # ---------- Minimum Spanning Tree ----------
-    T_csr  = minimum_spanning_tree(A)            # still CSR  (M×M)
-    mst_edges = np.vstack(T_csr.nonzero()).T     # (M-1, 2)  index pairs
-    mst_w     = T_csr.data  
-    return mst_edges, points
+#     # ---------- Minimum Spanning Tree ----------
+#     T_csr  = minimum_spanning_tree(A)            # still CSR  (M×M)
+#     mst_edges = np.vstack(T_csr.nonzero()).T     # (M-1, 2)  index pairs
+#     mst_w     = T_csr.data  
+#     return mst_edges, points
 
 def save_mst_ply(points, edges, path='mst.ply'):
     from plyfile import PlyElement, PlyData
+    if torch.is_tensor(points):
+        points = points.detach().cpu().numpy()
+    points = np.asarray(points, dtype=np.float32)
+    if torch.is_tensor(edges):
+        edges = edges.detach().cpu().numpy()
+    edges = np.asarray(edges)
+
     v = np.empty(points.shape[0], dtype=[('x','f4'),('y','f4'),('z','f4')])
     v['x'], v['y'], v['z'] = points.T
     e = np.empty(edges.shape[0], dtype=[('vertex1','u4'),('vertex2','u4')])
     e['vertex1'] = edges[:,0];  e['vertex2'] = edges[:,1]
     PlyData([PlyElement.describe(v,'vertex'),
              PlyElement.describe(e,'edge')], text=True).write(path)
-if __name__ == "__main__":
 
+# def build_mst_from_endpoints(endpoints, strpr_pairs, k=8):
+#     import networkx as nx
+#     M = endpoints.shape[0]
+#     endpoints_np = endpoints.detach().cpu().numpy()
+
+#     # kNN
+#     from sklearn.neighbors import NearestNeighbors
+#     nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='ball_tree').fit(endpoints_np)
+#     distances, indices = nbrs.kneighbors(endpoints_np)
+
+#     edges = []
+#     for i in range(M):
+#         for j, d in zip(indices[i,1:], distances[i,1:]): 
+#             edges.append((i,j,float(d)))
+
+#     # inner edges
+#     if strpr_pairs is not None:
+#         for a,b in strpr_pairs.tolist():
+#             edges.append((a,b,1e-6))
+
+#     # cross edges
+#     G = nx.Graph()
+#     G.add_weighted_edges_from(edges)
+#     T = nx.minimum_spanning_tree(G, weight='weight')
+
+#     tree_edges = np.array(list(T.edges()))
+#     return tree_edges
+
+def build_mst_from_endpoints(endpoints, strpr_pairs, k=16):
+    """
+    endpoints: (M,3) torch.Tensor
+    strpr_pairs: (S,2) torch.LongTensor or None
+    return: tree_edges [E,2] (numpy)
+    加入：轴向/切向连续性惩罚（通过局部 PCA 估计每点主轴）
+    """
     import numpy as np
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Ellipse
+    import networkx as nx
+    from sklearn.neighbors import NearestNeighbors
+    from numpy.linalg import svd
+
+    M = endpoints.shape[0]
+    X = endpoints.detach().cpu().numpy()
+
+    # ---------- 近邻图（候选 & 局部统计） ----------
+    k_eff = min(k+1, M)
+    knn = NearestNeighbors(n_neighbors=k_eff, algorithm='auto').fit(X)
+    dists, idxs = knn.kneighbors(X)
+
+    # 局部尺度/长度统计
+    local_scale = np.median(dists[:, 2:], axis=1) if dists.shape[1] > 2 else np.median(dists[:, 1:], axis=1)
+    mu_local  = np.mean(dists[:, 1:], axis=1)
+    std_local = np.std(dists[:, 1:], axis=1) + 1e-8
+
+    # ---------- 局部 PCA 估计每个端点主轴 u_i ----------
+    # 用稍大一点的邻域更稳
+    k_dir = min(max(12, k_eff), M)
+    knn_dir = NearestNeighbors(n_neighbors=k_dir, algorithm='auto').fit(X)
+    _, idxs_dir = knn_dir.kneighbors(X)
+
+    U = np.zeros_like(X)  # 每点主轴
+    for i in range(M):
+        P = X[idxs_dir[i]]  # (k_dir, 3)
+        C = P - P.mean(axis=0, keepdims=True)
+        # SVD: 第一主成分对应最大奇异值方向
+        try:
+            _, _, Vt = svd(C, full_matrices=False)
+            ui = Vt[0]  # (3,)
+        except np.linalg.LinAlgError:
+            ui = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        nrm = np.linalg.norm(ui) + 1e-12
+        U[i] = ui / nrm
+
+    # ---------- 占据计数（穿空惩罚） ----------
+    rad = NearestNeighbors(radius=1.0, algorithm='auto').fit(X)
+
+    # ---------- 超参（可调） ----------
+    alpha_len = 1.0        # 长度 z-score 权重
+    beta_void = 1.5        # 穿空惩罚权重
+    gamma_axis = 1.0       # 轴向一致性惩罚权重
+    gamma_tan  = 1.0       # 切向一致性惩罚权重
+
+    samples_min = 20
+    rho_scale = 1
+    count_thresh_factor = 4
+    max_samples = 32
+
+    def edge_cost(i, j, dij):
+        # --- 长度异常 z-score ---
+        mu_ij  = 0.5 * (mu_local[i] + mu_local[j])
+        std_ij = 0.5 * (std_local[i] + std_local[j])
+        z = abs(dij - mu_ij) / std_ij
+
+        # --- 穿空比例 p_void ---
+        step = 0.5 * float(max(1e-6, min(local_scale[i], local_scale[j])))
+        K = int(max(samples_min, min(max_samples, np.ceil(dij / step))))
+        tlin = np.linspace(0.0, 1.0, K, dtype=np.float32)[:, None]
+        S = X[i][None,:]*(1.0-tlin) + X[j][None,:]*tlin
+        rho = float(rho_scale * step)
+        rad.set_params(radius=rho)
+        neighs = rad.radius_neighbors(S, return_distance=False)
+        exp_cnt = max(4.0, 8.0 * (rho / (1e-6 + 0.5*(local_scale[i]+local_scale[j])))**3)
+        thr = count_thresh_factor * exp_cnt
+        p_void = float(np.mean([len(ii) < thr for ii in neighs]))
+
+        # --- 轴向/切向一致性（夹角惩罚） ---
+        tvec = (X[j] - X[i]) / (dij + 1e-12)
+        ui, uj = U[i], U[j]
+
+        cos_ij = abs(np.dot(ui, uj))  # 两端主轴一致性（无向）
+        cos_ti = abs(np.dot(tvec, ui))
+        cos_tj = abs(np.dot(tvec, uj))
+        pen_axis = 1.0 + gamma_axis * (1.0 - cos_ij)
+        pen_tan  = 1.0 + gamma_tan  * (1.0 - 0.5*(cos_ti + cos_tj))
+
+        # --- 综合 ---
+        penalty_geom = (1.0 + alpha_len * z) * (1.0 + beta_void * p_void)
+        w = float(dij) * penalty_geom * pen_axis * pen_tan
+        return w
+
+    # ---------- 候选边 ----------
+    edges = []
+    for i in range(M):
+        for j, d in zip(idxs[i,1:], dists[i,1:]):
+            if j <= i:
+                continue
+            w = edge_cost(i, int(j), float(d))
+            edges.append((i, int(j), w))
+
+    # 内部强制边（极小权重）
+    if strpr_pairs is not None and len(strpr_pairs) > 0:
+        pairs = strpr_pairs.detach().cpu().numpy()
+        for a, b in pairs.tolist():
+            if a == b: 
+                continue
+            ai, bj = int(min(a,b)), int(max(a,b))
+            edges.append((ai, bj, 1e-6))
+
+    # ---------- 构图 ----------
+    G = nx.Graph()
+    G.add_weighted_edges_from(edges)
+
+    # ---------- 跨分量补桥（确保单连通） ----------
+    if not nx.is_connected(G):
+        k2 = min(max(32, k_eff*2), M)
+        knn2 = NearestNeighbors(n_neighbors=k2, algorithm='auto').fit(X)
+        d2, i2 = knn2.kneighbors(X)
+
+        def connect_components(G):
+            comps = [list(c) for c in nx.connected_components(G)]
+            if len(comps) == 1:
+                return G, False
+            comp_id = np.full(M, -1, dtype=int)
+            for cid, nodes in enumerate(comps):
+                comp_id[nodes] = cid
+            best = None
+            for u in range(M):
+                cu = comp_id[u]
+                for v, d in zip(i2[u,1:], d2[u,1:]):
+                    v = int(v)
+                    if comp_id[v] == cu:
+                        continue
+                    w = edge_cost(u, v, float(d))
+                    if (best is None) or (w < best[0]):
+                        best = (w, u, v)
+            if best is not None:
+                w,u,v = best
+                G.add_edge(u, v, weight=w)
+                return G, True
+            return G, False
+
+        changed = True
+        while changed and (not nx.is_connected(G)):
+            G, changed = connect_components(G)
+
+    # ---------- MST ----------
+    T = nx.minimum_spanning_tree(G, weight='weight')
+    import numpy as np
+    tree_edges = np.array(list(T.edges()))
+    return tree_edges
 
 
+def compute_node_radius_from_edge_radius(
+    num_nodes: int,
+    edges: np.ndarray,          # (E,2) int
+    edge_radii: np.ndarray,     # (E,) float
+    reduce: Literal["max", "mean"] = "max",
+    fallback: float = 0.0,
+) -> np.ndarray:
+    edges = np.asarray(edges, dtype=np.int64)
+    edge_radii = np.asarray(edge_radii.detach().cpu(), dtype=np.float32)
 
-    
-    # args = parser.parse_args(sys.argv[1:])
-    # args.save_iterations.append(args.iterations)
-    
-    # print("Optimizing " + args.model_path)
+    node_r = np.full((num_nodes,), np.nan, dtype=np.float32)
+    # 累积
+    if reduce == "max":
+        node_r[:] = -np.inf
+        for (u, v), r in zip(edges, edge_radii):
+            node_r[u] = max(node_r[u], r)
+            node_r[v] = max(node_r[v], r)
+        node_r[~np.isfinite(node_r)] = fallback
+    else:
+        # mean
+        acc = np.zeros((num_nodes,), dtype=np.float64)
+        cnt = np.zeros((num_nodes,), dtype=np.int64)
+        for (u, v), r in zip(edges, edge_radii):
+            acc[u] += float(r); cnt[u] += 1
+            acc[v] += float(r); cnt[v] += 1
+        node_r = np.where(cnt > 0, (acc / np.maximum(1, cnt)), fallback).astype(np.float32)
+    # 最小半径下限，避免 tube 崩塌
+    eps = 1e-6
+    node_r = np.maximum(node_r, eps)
+    return node_r
 
-    # # Initialize system state (RNG)
-    # safe_state(args.quiet)
-    # torch.cuda.set_device(args.gpu)
-    # device = torch.device(f"cuda:{args.gpu}")
-    # print(f"Using device {device}")
-    # args.device = device
-    # gaussian_file = 'output/plant3_3dgs/point_cloud/iteration_3000/point_cloud.ply'
-    # dataset = lp.extract(args)
-    # opt = op.extract(args)
-    # pipeline = pp.extract(args)
-    # gaussian = GaussianModel(dataset.sh_degree, opt.optimizer_type, args.device)
-    # gaussian.load_ply(gaussian_file)
-    # gaussian.knn_to_track = 32
-    # gaussian.reset_neighbors()
-    # xyz = gaussian._xyz.detach().cpu().numpy()
-    
 
-    # """ don operator """
-    # # radius1 = 0.0001
-    # # radius2 = 0.1
-    # # threshold = 0.55
-    # # don_func(radius1, radius2,threshold, knn1=10,knn2=1000,method='radius')
+def build_polyline_graph(points: np.ndarray, edges: np.ndarray, node_radius: np.ndarray) -> pv.PolyData:
+    if hasattr(points, "detach"):
+        points = points.detach().cpu().numpy()
+    points = np.asarray(points, dtype=np.float32)
+    edges = np.asarray(edges, dtype=np.int64)
+    node_radius = np.asarray(node_radius, dtype=np.float32)
 
-    # """ RANSAC clustering """
-    # fit_cylinder_ransac(xyz, num_iterations=1000, distance_threshold=0.01)
-    # # based on gaussian parameter
-    # # cov_matrices = gaussian.get_covariance(return_full=True)
-    # # eigvals = torch.linalg.eigvalsh(cov_matrices)  # (N, 3)
-    # # sigma_max, sigma_min = eigvals[:, -1], eigvals[:, 0]
-    # # anisotropy = (sigma_max - sigma_min) / (sigma_max + 1e-8)
-    # # normals = gaussian.get_smallest_axis()
-    # pass
+    lines = np.empty(edges.shape[0] * 3, dtype=np.int64)
+    lines[0::3] = 2
+    lines[1::3] = edges[:, 0]
+    lines[2::3] = edges[:, 1]
+
+    poly = pv.PolyData(points)
+    poly.lines = lines
+    poly["radius"] = node_radius  # point_data 标量
+    return poly
+
+def prune_leaf_strpr_by_radius_growth(tree_edges_ep, node_r_ep, tau=0.30, root=None, max_passes=10):
+    """
+    Radius-growth sanity check at the StrPr level, based on an endpoint-level MST.
+
+    Args:
+        tree_edges_ep : (E,2) ndarray of int
+            Endpoint-level MST edges over 2*N_strpr nodes (0..2N-1).
+        node_r_ep     : (2*N,) ndarray of float
+            Radius per endpoint node.
+        tau           : float
+            Prune leaf StrPr if r_child > (1+tau)*r_parent.
+        root          : int or None
+            Root StrPr id. If None, use the max-radius StrPr as root.
+        max_passes    : int
+            Max pruning iterations.
+
+    Returns:
+        prune_mask_strpr : (N,) bool
+            True for StrPr to prune.
+        kept_edges_ep    : (E_kept,2) ndarray
+            Endpoint-level edges after removing pruned StrPr endpoints.
+        parent_strpr     : (N,) int
+            Parent StrPr id for each node (-1 for root or pruned).
+    """
+    tree_edges_ep = np.asarray(tree_edges_ep, dtype=np.int64)
+    node_r_ep     = np.asarray(node_r_ep, dtype=np.float32)
+    assert tree_edges_ep.ndim == 2 and tree_edges_ep.shape[1] == 2, "tree_edges_ep must be (E,2)"
+    M = node_r_ep.shape[0]
+    assert M % 2 == 0, "Endpoint count must be even (2*N_strpr)."
+    N = M // 2  # number of StrPr
+
+    # --- StrPr 半径：取两个端点半径的均值（可按需换成 max/median）
+    r_strpr = (node_r_ep[0::2] + node_r_ep[1::2]) * 0.5  # (N,)
+
+    # --- 端点对（内部边）：(2i,2i+1)
+    def is_inner_edge(u, v):
+        return (u // 2) == (v // 2)
+
+    # --- 压缩为 StrPr 级边（只保留跨 StrPr；多条端点跨边归并为一条）
+    edges_sp = set()
+    for u, v in tree_edges_ep:
+        su, sv = u // 2, v // 2
+        if su != sv:
+            a, b = (su, sv) if su < sv else (sv, su)
+            edges_sp.add((a, b))
+    edges_sp = np.array(list(edges_sp), dtype=np.int64)  # (E_sp,2)
+
+    # ---- 若端点 MST 极端稀疏导致 StrPr 图不连通，照样逐分量处理 ----
+    # 先构图
+    adj_sp = defaultdict(list)
+    for a, b in edges_sp:
+        adj_sp[a].append(b); adj_sp[b].append(a)
+
+    # 选根：最大半径 StrPr（或用户给定）
+    if root is None:
+        root = int(np.argmax(r_strpr))
+
+    # BFS 得到 parent/depth（在 StrPr 图里）
+    parent = -np.ones(N, dtype=np.int64)
+    depth  = -np.ones(N, dtype=np.int64)
+    q = deque([root])
+    parent[root] = -1
+    depth[root]  = 0
+    order = []
+    while q:
+        u = q.popleft()
+        order.append(u)
+        for v in adj_sp[u]:
+            if depth[v] == -1:
+                parent[v] = u
+                depth[v]  = depth[u] + 1
+                q.append(v)
+
+    # 度数（StrPr 级，仅跨边）
+    deg = np.zeros(N, dtype=np.int32)
+    for a, b in edges_sp:
+        deg[a] += 1
+        deg[b] += 1
+
+    prune_mask = np.zeros(N, dtype=bool)
+    thr = 1.0 + float(tau)
+
+    # 迭代：只剪叶子（deg==1）且半径增长异常的 StrPr
+    for _ in range(max_passes):
+        to_prune = []
+        for v in range(N):
+            if prune_mask[v] or v == root:
+                continue
+            if deg[v] == 1:  # leaf StrPr only
+                p = parent[v]
+                if (p >= 0) and (not prune_mask[p]):
+                    if r_strpr[v] > thr * r_strpr[p]:
+                        to_prune.append(v)
+        if not to_prune:
+            break
+        # 应用剪枝：标记并更新度
+        for v in to_prune:
+            prune_mask[v] = True
+            for u in adj_sp[v]:
+                if not prune_mask[u]:
+                    deg[u] = max(0, deg[u] - 1)
+            deg[v] = 0
+
+    # --- 把被剪的 StrPr 映射回端点，过滤端点级边 ---
+    prune_mask_ep = np.repeat(prune_mask, 2)  # [2*N], True for both endpoints of pruned StrPr
+    kept_edges_ep = []
+    for u, v in tree_edges_ep:
+        if (not prune_mask_ep[u]) and (not prune_mask_ep[v]):
+            kept_edges_ep.append((u, v))
+    kept_edges_ep = np.asarray(kept_edges_ep, dtype=np.int64)
+
+    # 被剪节点 parent 置 -1
+    parent[prune_mask] = -1
+
+    return prune_mask, kept_edges_ep, parent

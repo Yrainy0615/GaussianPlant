@@ -13,8 +13,11 @@ import numpy as np
 import os
 import torch
 from matplotlib import pyplot as plt
-from skimage.morphology import skeletonize
-
+import torch.nn.functional as F
+import torch.nn as nn
+import numpy as np
+pca_mean = None
+top_vector = None
 
 
 def mse(img1, img2):
@@ -49,43 +52,138 @@ def save_tensor_as_image(tensor, save_name):
     
     
 
-def build_laplacian_pyramid(image, num_levels=4):
-    # 构建高斯金字塔
-    gaussian_pyramid = [image.copy()]
-    for i in range(num_levels):
-        image = cv2.pyrDown(image)
-        gaussian_pyramid.append(image)
+def feature_map(feature):
+    global pca_mean
+    global top_vector
+    fmap = feature[None, :, :, :]  # torch.Size([1, 512, h, w])
+    fmap = nn.functional.normalize(fmap, dim=1)
 
-    # 构建拉普拉斯金字塔
-    laplacian_pyramid = []
-    for i in range(num_levels, 0, -1):
-        GE = cv2.pyrUp(gaussian_pyramid[i])
-        GE = cv2.resize(GE, (gaussian_pyramid[i-1].shape[1], gaussian_pyramid[i-1].shape[0]))  # 尺寸对齐
-        L = cv2.subtract(gaussian_pyramid[i-1], GE)
-        laplacian_pyramid.append(L)
+    # Reshape and normalize
+    f_samples = fmap.permute(0, 2, 3, 1).reshape(-1, fmap.shape[1])[::3]
 
-    return laplacian_pyramid
+    # Perform PCA using torch
+    if pca_mean is None:
+        pca_mean = f_samples.mean(dim=0, keepdim=True)
+    mean = pca_mean
+    f_samples_centered = f_samples - mean
+    covariance_matrix = f_samples_centered.T @ f_samples_centered / (f_samples_centered.shape[0] - 1)
 
-def show_laplacian_pyramid(lap_pyr):
-    plt.figure(figsize=(15, 5))
-    for i, layer in enumerate(lap_pyr):
-        layer_show = cv2.normalize(layer, None, 0, 255, cv2.NORM_MINMAX)
-        plt.subplot(1, len(lap_pyr), i+1)
-        # plt.imshow(cv2.cvtColor(layer_show.astype(np.uint8), cv2.COLOR_BGR2RGB))
-        plt.title(f"Laplacian Level {i}")
-        plt.axis('off')
-        plt.imsave(f"laplacian_level_{i}_blur.png", layer_show)
+    eig_values, eig_vectors = torch.linalg.eigh(covariance_matrix)
+    if top_vector is None:
+        top_vector = eig_vectors[:, -3:]
+    top_eig_vectors = top_vector
 
-    plt.tight_layout()
+    transformed = f_samples_centered @ top_eig_vectors
 
-if __name__ == "__main__":
-    # Example usage
-    # image = cv2.imread("data/plant3/images/0009.png")
-    image = cv2.imread("blur.png")
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
+    q1, q99 = transformed.quantile(0.01, dim=0), transformed.quantile(0.99, dim=0)
+    feature_pca_postprocess_sub = q1
+    feature_pca_postprocess_div = q99 - q1
 
-    lap_pyr = build_laplacian_pyramid(image, num_levels=4)
-    show_laplacian_pyramid(lap_pyr)
-    # gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # blur = cv2.GaussianBlur(image, (31, 31), sigmaX=10, sigmaY=10)
-    # cv2.imwrite('blur.png', blur)
+    vis_feature = (fmap.permute(0, 2, 3, 1).reshape(-1, fmap.shape[1]) - mean) @ top_eig_vectors
+    vis_feature = (vis_feature - feature_pca_postprocess_sub) / feature_pca_postprocess_div
+    vis_feature = vis_feature.clamp(0.0, 1.0).float().reshape((fmap.shape[2], fmap.shape[3], 3))
+
+    return vis_feature.permute(2, 0, 1)  # torch.Size([3, h, w])
+
+def gradient_map(image):
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).float().unsqueeze(0).unsqueeze(0).cuda()/4
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).float().unsqueeze(0).unsqueeze(0).cuda()/4
+
+    grad_x = torch.cat([F.conv2d(image[i].unsqueeze(0), sobel_x, padding=1) for i in range(image.shape[0])])
+    grad_y = torch.cat([F.conv2d(image[i].unsqueeze(0), sobel_y, padding=1) for i in range(image.shape[0])])
+    magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+    magnitude = magnitude.norm(dim=0, keepdim=True)
+
+    return magnitude
+
+def depth_to_normal(depth_map, camera):
+    # Unproject depth map to obtain 3D points
+    depth_map = depth_map.squeeze()
+    height, width = depth_map.shape
+    points_world = torch.zeros((height + 1, width + 1, 3)).to(depth_map.device)
+    points_world[:height, :width, :] = unproject_depth_map(depth_map, camera)
+
+    # Extract neighboring 3D points
+    p1 = points_world[:-1, :-1, :]
+    p2 = points_world[1:, :-1, :]
+    p3 = points_world[:-1, 1:, :]
+
+    # Compute vectors between neighboring points
+    v1 = p2 - p1
+    v2 = p3 - p1
+
+    # Compute cross product to get normals
+    normals = torch.cross(v1, v2, dim=-1)
+
+    # Normalize the normals
+    normals = normals / (torch.norm(normals, dim=-1, keepdim=True)+1e-8)
+
+    return normals
+
+def unproject_depth_map(depth_map, camera):
+    depth_map = depth_map.squeeze()
+    height, width = depth_map.shape
+    x = torch.linspace(0, width - 1, width).cuda()
+    y = torch.linspace(0, height - 1, height).cuda()
+    Y, X = torch.meshgrid(y, x, indexing='ij')
+
+    # Reshape the depth map and grid to N x 1
+    depth_flat = depth_map.reshape(-1)
+    X_flat = X.reshape(-1)
+    Y_flat = Y.reshape(-1)
+
+    # Normalize pixel coordinates to [-1, 1]
+    X_norm = (X_flat / (width - 1)) * 2 - 1
+    Y_norm = (Y_flat / (height - 1)) * 2 - 1
+
+    # Create homogeneous coordinates in the camera space
+    points_camera = torch.stack([X_norm, Y_norm, depth_flat], dim=-1)    
+
+    K_matrix = camera.projection_matrix
+    # parse out f1, f2 from K_matrix
+    f1 = K_matrix[2, 2]
+    f2 = K_matrix[3, 2]
+
+    # get the scaled depth
+    sdepth = (f1 * points_camera[..., 2:3] + f2) / (points_camera[..., 2:3] + 1e-8)
+
+    # concatenate xy + scaled depth
+    points_camera = torch.cat((points_camera[..., 0:2], sdepth), dim=-1)
+    points_camera = points_camera.view((height,width,3))
+    points_camera = torch.cat([points_camera, torch.ones_like(points_camera[:, :, :1])], dim=-1)  
+    points_world = torch.matmul(points_camera, camera.full_proj_transform.inverse())
+
+    # Discard the homogeneous coordinate
+    points_world = points_world[:, :, :3] / points_world[:, :, 3:]
+    points_world = points_world.view((height,width,3))
+
+    return points_world
+
+def colormap(map, cmap="turbo"):
+    colors = torch.tensor(plt.cm.get_cmap(cmap).colors).to(map.device)
+    map = (map - map.min()) / (map.max() - map.min())
+    map = (map * 255).round().long().squeeze()
+    map = colors[map].permute(2,0,1)
+    return map
+
+def render_net_image(render_pkg, render_items, render_mode, camera):
+    output = render_items[render_mode].lower()
+    if output == 'depth':
+        net_image = render_pkg["depth"]
+    elif output == 'edge':
+        net_image = gradient_map(render_pkg["render"])
+    elif output == 'normal':
+        net_image = depth_to_normal(render_pkg["depth"], camera).permute(2,0,1)
+        net_image = (net_image+1)/2
+    elif output == 'curvature':
+        net_image = depth_to_normal(render_pkg["depth"], camera).permute(2,0,1)
+        net_image = (net_image+1)/2
+        net_image = gradient_map(net_image)
+    elif output == 'feature map':
+        net_image = feature_map(render_pkg['feature_map'])
+    else:
+        net_image = render_pkg["render"]
+
+    if net_image.shape[0]==1:
+        net_image = colormap(net_image)
+    return net_image

@@ -1,0 +1,26 @@
+# Python dependencies for the gsplant environment.
+# Install AFTER PyTorch (see README step 2). gsplat / faiss-gpu-cu12 / simple-knn
+# are installed separately (README steps 4-5).
+numpy<2
+scipy
+scikit-learn
+scikit-image
+plyfile
+trimesh
+networkx
+open3d
+pyvista
+opencv-python
+torchmetrics
+pytorch-msssim
+lpips
+tqdm
+matplotlib
+imageio
+omegaconf
+pyyaml
+tensorboard
+ftfy
+regex
+termcolor
+ninja

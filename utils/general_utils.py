@@ -16,6 +16,7 @@ import numpy as np
 import random
 import trimesh
 
+
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
@@ -131,7 +132,7 @@ def safe_state(silent):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda:0"))
+    # torch.cuda.set_device(torch.device("cuda:0"))
 
 
 def read_mesh_as_pointcloud(path, save_path):
