@@ -101,14 +101,24 @@ COLMAP capture plus a pretrained **feature 3DGS**:
 <root_path>/
 ├── dinov3_pca.pth, dinov3_text_feats.pth      # shared assets
 ├── pretrain_clean/
-│   └── <scene>_clean_pruned.ply               # background-removed feature cloud → StrPr/AppGS source
+│   └── <scene>_clean_pruned.ply               # plant-only feature cloud — PRODUCED, see note (StrPr/AppGS source)
 └── <scene>/
     ├── sparse/0, images/, masks/, depths/     # COLMAP scene
     ├── dinov3_dim128/                         # per-view DINOv3+JaFAR feature maps, PCA-128 (Step 1a)
     └── feature_pretrain/point_cloud/iteration_30000/
         ├── point_cloud.ply                    # 3DGS + 128-d semantic + branch/leaf label
-        └── point_cloud_branch_dense.ply       # GT dense branch points (Chamfer target)
+        └── point_cloud_branch_dense.ply       # GT dense branch points — EVALUATION ONLY (not used in training)
 ```
+
+> [!NOTE]
+> - **`pretrain_clean/*_clean_pruned.ply` is not a given asset** — it is the feature
+>   cloud with the pot/background removed, which you produce yourself: either by
+>   **DBSCAN** on the feature cloud (keep the plant cluster) or by projecting the 2D
+>   plant **masks** to 3D (the built-in `--rm_bg` path, `compute_plant_mask`). Pass the
+>   result via `--clean_ply`, or skip it and let `--rm_bg` build it on the fly.
+> - **Training uses no ground truth.** Step 2 is fully self-supervised (re-rendering
+>   loss against the images + feature pretrain). `point_cloud_branch_dense.ply` is read
+>   **only** by `eval_chamfer.py` to score the result.
 
 ---
 
