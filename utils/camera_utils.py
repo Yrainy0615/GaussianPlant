@@ -11,8 +11,9 @@
 
 from scene.cameras import Camera
 import numpy as np
+from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
-from PIL import Image
+from PIL import Image, ImageOps
 import cv2
 import torch
 
@@ -20,6 +21,9 @@ WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     image = Image.open(cam_info.image_path)
+    image = ImageOps.exif_transpose(image)
+    # print("Loading branch:", cam_info.branch_path)
+    branch = Image.open(cam_info.branch_path)
     mask_binary = None
     if cam_info.mask_path != "":
         mask = Image.open(cam_info.mask_path).convert('L')
@@ -70,10 +74,10 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
 
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
-
+    gt_feature_map = cam_info.semantic_feature
     return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap, mask=mask_binary,
+                  image=image, invdepthmap=invdepthmap, mask=mask_binary, semantic_feature=gt_feature_map, branch=branch,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
 

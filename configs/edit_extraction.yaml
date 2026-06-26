@@ -1,0 +1,5 @@
+edit:
+  objects: ["stem","leaf",'background']
+  operations: "extraction" 
+  targets: "stem" # the target object should be chosen from the object list
+  threshold:  # leave it empty if using argmax

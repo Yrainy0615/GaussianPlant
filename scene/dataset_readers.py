@@ -22,6 +22,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+import torch
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -34,9 +35,12 @@ class CameraInfo(NamedTuple):
     image_name: str
     depth_path: str
     mask_path: str
+    feature_path: str
+    branch_path: str
     width: int
     height: int
     is_test: bool
+    semantic_feature: torch.tensor 
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -45,6 +49,7 @@ class SceneInfo(NamedTuple):
     nerf_normalization: dict
     ply_path: str
     is_nerf_synthetic: bool
+    semantic_feature_dim: int
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -69,7 +74,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, mask_folder,test_cam_names_list):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, mask_folder, feature_folder, branch_folder,test_cam_names_list):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -110,10 +115,22 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
         mask_path = os.path.join(mask_folder, f"{extr.name[:-n_remove]}.JPG") if mask_folder != "" else ""
-        
+        if not os.path.exists(mask_path):
+            print(f"\nSkipping {image_name}: mask not found at {mask_path}")
+            continue
+        branch_path = os.path.join(branch_folder, f"{extr.name[:-n_remove]}.JPG") if mask_folder != "" else ""
+        semantic_feature_path = os.path.join(feature_folder, f"{extr.name[:-n_remove]}_dinov3_128.pth")  
+        semantic_feature_name = os.path.basename(semantic_feature_path).split(".")[0]
+        try:
+            semantic_feature = torch.load(semantic_feature_path, map_location='cpu')
+            semantic_feature = semantic_feature.squeeze(0) if semantic_feature.dim() == 4 else semantic_feature
+        except:
+            semantic_feature = None
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path, mask_path=mask_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              feature_path=semantic_feature_path, branch_path=branch_path,
+                              width=width, height=height, is_test=image_name in test_cam_names_list,
+                              semantic_feature=semantic_feature)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -150,7 +167,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, masks,eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, masks,features,eval, train_test_exp, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -203,8 +220,15 @@ def readColmapSceneInfo(path, images, depths, masks,eval, train_test_exp, llffho
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
         depths_folder=os.path.join(path, depths) if depths != "" else "", 
-        mask_folder=os.path.join(path,'masks') if masks != "" else "" , test_cam_names_list=test_cam_names_list)
+        mask_folder=os.path.join(path,'masks') if masks != "" else "" ,
+        feature_folder=os.path.join(path, features) if features != "" else "",
+        branch_folder = os.path.join(path,features,'branch'), test_cam_names_list=test_cam_names_list)
+    
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    try:
+        semantic_feature_dim = cam_infos[0].semantic_feature.shape[0]
+    except:
+        semantic_feature_dim = None
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
@@ -231,6 +255,7 @@ def readColmapSceneInfo(path, images, depths, masks,eval, train_test_exp, llffho
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
+                           semantic_feature_dim=semantic_feature_dim,
                            is_nerf_synthetic=False)
     return scene_info
 

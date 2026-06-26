@@ -181,3 +181,91 @@ def label_loss(label):
     p = torch.sigmoid(label)
     loss = p * (1 - p)
     return loss
+
+
+def weighted_chamfer(
+    P, Wp, Q, Wq, squared=True, softmin_tau=None, eps=1e-8
+):
+    """
+    P:  (Np,3) predicted points (e.g., branch candidates from StrPr/AppGa)
+    Wp: (Np,)  weights in [0,1]  (soft branch probs for P)
+    Q:  (Nq,3) target/GT points (e.g., branch GT cloud)
+    Wq: (Nq,)  weights in [0,1]  (soft branch probs for Q; often ones if GT)
+    Returns: scalar weighted bidirectional Chamfer loss.
+    """
+    Wq = torch.ones(Q.shape[0], device=Q.device) if Wq is None else Wq
+    if P.numel() == 0 or Q.numel() == 0:
+        return P.new_tensor(0.0)
+
+    # pairwise distances
+    # d(i,j) = ||P_i - Q_j||^2 or ||.|| (choose with `squared`)
+    dists = torch.cdist(P, Q, p=2)                      # (Np, Nq)
+    if squared:
+        dists = dists.pow(2)
+
+    # ----- direction P -> Q -----
+    if softmin_tau is None:
+        d1, _ = dists.min(dim=1)                        # (Np,)
+    else:
+        # softmin: alpha_ij = softmax(-d/tau) over j
+        alpha = torch.softmax(-dists / softmin_tau, dim=1)   # (Np,Nq)
+        d1 = (alpha * dists).sum(dim=1)                      # (Np,)
+
+    num1 = (Wp * d1).sum()
+    den1 = Wp.sum().clamp_min(eps)
+    loss_pq = num1 / den1
+
+    # ----- direction Q -> P -----
+    if softmin_tau is None:
+        d2, _ = dists.min(dim=0)                        # (Nq,)
+    else:
+        beta = torch.softmax(-dists.t() / softmin_tau, dim=1)  # (Nq,Np)
+        d2 = (beta * dists.t()).sum(dim=1)                     # (Nq,)
+
+    num2 = (Wq * d2).sum()
+    den2 = Wq.sum().clamp_min(eps)
+    loss_qp = num2 / den2
+
+    return 0.5 * (loss_pq + loss_qp)
+
+def laplacian_smooth_loss(points, edges):
+    """
+    points: (N,3)
+    edges:  (M,2) long tensor
+    """
+    N = points.shape[0]
+    device = points.device
+    edges = torch.tensor(edges, device=device, dtype=torch.long)
+    # 无向图 → 双向边
+    i = edges[:,0]
+    j = edges[:,1]
+    idx_i = torch.cat([i,j], dim=0)   # 2M
+    idx_j = torch.cat([j,i], dim=0)   # 2M
+
+    
+    agg = torch.zeros_like(points)             # (N,3)
+    agg.index_add_(0, idx_i, points[idx_j])    
+
+    # 度数
+    deg = torch.zeros(N, device=device)
+    deg.index_add_(0, idx_i, torch.ones_like(idx_i, dtype=deg.dtype, device=device))
+
+    # 计算 (p_i - 平均邻居)
+    mask = deg > 0
+    avg = torch.zeros_like(points)
+    avg[mask] = agg[mask] / deg[mask][:,None]
+
+    lap = points - avg
+    return (lap**2).sum(dim=1).mean()
+
+def loss_endpoints(top, bottom, mst_edges):
+    p = torch.stack((top, bottom), dim=1)  # (N,2,3)
+    p = p.view(-1, 3)   
+    edge_idx = torch.from_numpy(mst_edges).to(top.device)
+    mask_cross =(edge_idx[:, 0]+1 != edge_idx[:, 1])
+    edge_cross = edge_idx[mask_cross].to(top.device)
+    pi = p[edge_cross[:, 0]]
+    pj = p[edge_cross[:, 1]]
+    loss_graph = ((pi-pj)**2).sum(dim=-1).mean()
+    return loss_graph
+    

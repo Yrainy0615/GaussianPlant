@@ -12,6 +12,7 @@
 import os
 import random
 import json
+from turtle import speed
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -19,7 +20,12 @@ from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 import open3d as o3d
 from utils.gs_utils import save_mst_ply
-
+import torch
+from scene.models import CNN_decoder
+from utils.gs_utils import strpr_to_cylinder, build_mst_from_endpoints,save_mst_ply, build_mst_from_endpoints
+from utils.general_utils import safe_state, get_expon_lr_func, build_rotation
+from utils.visualization import TorchPCA 
+import numpy as np
 class Scene:
 
     gaussians : GaussianModel
@@ -32,11 +38,18 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.pca = None
+        self.pca_low = None
         if args.mask_path is not None:
             mask = args.mask_path
         else:
             mask = None
+        if args.feature_path is not None:
+            feature = args.feature_path
+        else:
+            feature = None
 
+        args.pretrain_path =  "feature_pretrain" 
         if load_iteration:
             if load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
@@ -48,7 +61,7 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, mask,args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, mask,feature, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
@@ -80,45 +93,59 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
-
+        
+        # load pca and text feats
+        pca_checkpoint = torch.load(os.path.join(args.root_path, 'dinov3_pca.pth'), map_location='cpu')
+        text_checkpoints = torch.load(os.path.join(args.root_path, "dinov3_text_feats.pth"), map_location='cpu')
+        gaussians.text_feats = text_checkpoints['text_feats_dim128'][:3,].to(args.data_device)  # [stem,leaf]
+        gaussians.text_feats_fgbg = text_checkpoints['text_feats_dim128'][2:,].to(args.data_device)  # [background, plant]
+        gaussians.pca = pca_checkpoint['pca']
+        gaussians.pca_low = pca_checkpoint['pca128']
+        
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path,
-                                                           "point_cloud",
+            # keep first two / in self.model_path 
+            # base_path = "/".join(self.model_path.split("/")[:2])
+            try:
+                self.gaussians.load_ply(os.path.join(args.source_path,
+                                                           f"{args.pretrain_path}/point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"), args.train_test_exp)
-        else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
+                                                           "point_cloud.ply")) # args.train_test # clean
+            except: 
+                self.gaussians.load_ply(os.path.join(args.source_path,
+                                                            f"{args.pretrain_path}/point_cloud",
+                                                            "iteration_" + str(self.loaded_iter),
+                                                            "point_cloud.ply")) # args.train_test
+            branch_points_path = os.path.join(args.source_path, "branch.ply")
+            try:
+                branch_gt = o3d.io.read_point_cloud(branch_points_path)
+                self.gt_branch_points = torch.from_numpy(np.asarray(branch_gt.points)).float()
+            except:
+                self.gt_branch_points = None
 
-    def save(self, iteration,save_gs=False,save_stpr=False,save_app=False,save_branch=False,save_mst=True):
-        if save_gs:
-            point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-            self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        if save_stpr and self.gaussians.structure_gs is not None:
-            point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-            self.gaussians.structure_gs.save_ply(os.path.join(point_cloud_path, "stprs.ply"))
-            self.gaussians.structure_gs.save_ply(os.path.join(point_cloud_path, "stprs_branch.ply"),save_only_branch=True)
-            self.gaussians.save_stpr_app_correspondence(os.path.join(point_cloud_path, "stpr_app_correspondence"))
-        if save_app and self.gaussians.appgs is not None:
-            point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-            self.gaussians.appgs.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        if save_branch and self.gaussians.cylinder_mesh is not None:
-            self.gaussians.build_surface()
-            branch = self.gaussians.cylinder_mesh
-            branch_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-            o3d.io.write_triangle_mesh(os.path.join(branch_path, "branch.ply"), branch)
-        if save_mst and self.gaussians.structure_gs is not None:
-            mst_edges, points,_ = self.gaussians.stpr_to_graph()
-            save_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-            save_mst_ply(points, mst_edges, os.path.join(save_path, "mst.ply"))
-        exposure_dict = {
-            image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
-            for image_name in self.gaussians.exposure_mapping
-        }
-        if iteration ==6999 and self.gaussians.structure_gs is None:
-            point_cloud_path= os.path.join(self.args.source_path, "points_3dgs.ply")
-            self.gaussians.save_ply(point_cloud_path)
-        with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
-            json.dump(exposure_dict, f, indent=2)
+        else:
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, scene_info.semantic_feature_dim, speedup=args.speedup) # 384
+    
+    def save(self, iteration):
+        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        if self.gaussians.strprs is not None:
+            self.gaussians.strprs.save_ply(os.path.join(point_cloud_path, "strpr.ply"))
+            branch_mask, leaf_mask, _ = self.gaussians.get_cls_mask(label_threshold=0.5, mode='geo')
+            self.gaussians.strprs.save_branch_ply(os.path.join(point_cloud_path, "strpr_branch.ply"), branch_mask)
+
+            mst_edges, points, appgas_branch_points = self.gaussians.build_branch_graph()
+            save_mst_ply( points, mst_edges, os.path.join(point_cloud_path, "mst.ply"))
+            branch_pd = o3d.geometry.PointCloud()
+            branch_pd.points = o3d.utility.Vector3dVector(appgas_branch_points.detach().cpu().numpy())
+            o3d.io.write_point_cloud(os.path.join(point_cloud_path, "branch.ply"), branch_pd)
+            _, _, mesh_list = strpr_to_cylinder(pos=self.gaussians.strprs._xyz, 
+                            S=self.gaussians.strprs.get_scaling, 
+                            R=build_rotation(self.gaussians.strprs.get_rotation), 
+                            save_path=os.path.join(point_cloud_path, "branch_cylinder.ply"),
+                            create_mesh=True,
+                            iteration=0)
+        if self.gaussians.appgas is not None and not os.path.exists(os.path.join(point_cloud_path, "appgas.ply")):
+            self.gaussians.appgas.save_ply(os.path.join(point_cloud_path, "appgas.ply"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

@@ -48,15 +48,22 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
+        self.root_path = "/mnt/data"
         self._model_path = ""
         self._images = "images"
+        # self.pretrain_path = "feature_pretrain"
         self._depths = ""
-        self.mask_path = ""
+        self.mask_path = "masks"
+        self.feature_path = "dinov3_dim128"
+        self.f_name = ""
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = True
+        self.speedup = False
+        self.render_items = ['RGB', 'Depth', 'Edge', 'Normal', 'Curvature', 'Feature Map']
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -81,31 +88,34 @@ class OptimizationParams(ParamGroup):
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.025
-        self.scaling_lr = 0.005
-        self.scaling_lr_stpr = 0.01
+        self.scaling_lr = 0.005 # 0.005
+        self.label_lr = 0.001
+        self.percent_dense = 0.01
+        self.semantic_feature_lr = 0.001 
         self.rotation_lr = 0.001
-        self.rotation_lr_stpr = 0.003
         self.exposure_lr_init = 0.01
         self.exposure_lr_final = 0.001
         self.exposure_lr_delay_steps = 0
         self.exposure_lr_delay_mult = 0.0
-        self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.lambda_mask = 0.2
-        self.lambda_align = 0.5
-        self.lambda_overlap = 1
-        self.lambda_freq = 0.2
-        self.lambda_opacity = 0.05
-        self.lambda_ani = 0.01
-        self.lambda_mst = 0.2
-        self.lambda_color = 0.01
-        self.lambda_bind = 0.2
-        self.lambda_geo = 1
+        self.lambda_op = 0.05
+        self.lambda_size = 0.5    # penalise oversized StrPr (within the overlap term)
+        self.lambda_graph = 10
+        self.lambda_bind = 0.1
+        self.lambda_align = 0.1
+        self.lambda_axis = 1.0    # branch StrPr long-axis -> branch-tangent alignment
+        self.lambda_sem = 0.001
+        self.lambda_col = 1.0     # L_col: pull StrPr label toward (fixed) color-consistent class
+        self.lambda_conf = 0.05   # L_conf: p(1-p) confidence (deprecated; collapses -> not wired)
+        self.lambda_bfrac = 2.0   # branch-fraction prior: keep mean(p) ~ branch_frac (anti-collapse)
+        self.lambda_label = 1.0   # pull StrPr label toward the shape(dimensionality)+colour target
+        self.w_shape = 2.0        # weight of the binding dimensionality cue (linearity-planarity)
+        self.w_col_lab = 2.0      # weight of the colour cue (brown=branch) in the label target
         self.densification_interval = 100
-        self.opacity_reset_interval = 3000
+        self.opacity_reset_interval = 1000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
-        self.densify_grad_threshold = 0.0005
+        self.densify_until_iter = 5000
+        self.densify_grad_threshold = 0.0002
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False

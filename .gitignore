@@ -11,5 +11,13 @@ data
 Depth-Anything-V2
 *.obj
 *.mtl
+third_party
+checkpoints
+diff-gaussian-rasterization-feature
 
-
+# third-party feature/depth encoders (Step 1 only)
+dinov3
+# editor / vim swap files
+*.swp
+*.swo
+__pycache__/
