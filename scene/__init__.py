@@ -22,7 +22,7 @@ import open3d as o3d
 from utils.gs_utils import save_mst_ply
 import torch
 from scene.models import CNN_decoder
-from utils.gs_utils import strpr_to_cylinder, build_mst_from_endpoints,save_mst_ply, build_mst_from_endpoints
+from utils.gs_utils import build_mst_from_endpoints, save_mst_ply
 from utils.general_utils import safe_state, get_expon_lr_func, build_rotation
 from utils.visualization import TorchPCA 
 import numpy as np
@@ -138,12 +138,6 @@ class Scene:
             branch_pd = o3d.geometry.PointCloud()
             branch_pd.points = o3d.utility.Vector3dVector(appgas_branch_points.detach().cpu().numpy())
             o3d.io.write_point_cloud(os.path.join(point_cloud_path, "branch.ply"), branch_pd)
-            _, _, mesh_list = strpr_to_cylinder(pos=self.gaussians.strprs._xyz, 
-                            S=self.gaussians.strprs.get_scaling, 
-                            R=build_rotation(self.gaussians.strprs.get_rotation), 
-                            save_path=os.path.join(point_cloud_path, "branch_cylinder.ply"),
-                            create_mesh=True,
-                            iteration=0)
         if self.gaussians.appgas is not None and not os.path.exists(os.path.join(point_cloud_path, "appgas.ply")):
             self.gaussians.appgas.save_ply(os.path.join(point_cloud_path, "appgas.ply"))
 
