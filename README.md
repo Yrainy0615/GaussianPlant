@@ -106,7 +106,7 @@ COLMAP capture plus a pretrained **feature 3DGS**:
     ├── sparse/0, images/, masks/, depths/     # COLMAP scene
     ├── dinov3_dim128/                         # per-view DINOv3+JaFAR feature maps, PCA-128 (Step 1a)
     └── feature_pretrain/point_cloud/iteration_30000/
-        ├── point_cloud.ply                    # 3DGS + 128-d semantic + branch/leaf label
+        ├── point_cloud.ply                    # 3DGS + 128-d semantic feature (no label; see note)
         └── point_cloud_branch_dense.ply       # GT dense branch points — EVALUATION ONLY (not used in training)
 ```
 
@@ -116,6 +116,10 @@ COLMAP capture plus a pretrained **feature 3DGS**:
 >   **DBSCAN** on the feature cloud (keep the plant cluster) or by projecting the 2D
 >   plant **masks** to 3D (the built-in `--rm_bg` path, `compute_plant_mask`). Pass the
 >   result via `--clean_ply`, or skip it and let `--rm_bg` build it on the fly.
+> - **The feature 3DGS carries no branch/leaf label.** `point_cloud.ply` stores colour
+>   + the 128-d semantic feature only; the branch/leaf label is **derived in Step 2** at
+>   init (`build_strpr_from_gs`, joint = colour + geometry + semantic), not loaded from
+>   the pretrain.
 > - **Training uses no ground truth.** Step 2 is fully self-supervised (re-rendering
 >   loss against the images + feature pretrain). `point_cloud_branch_dense.ply` is read
 >   **only** by `eval_chamfer.py` to score the result.
@@ -155,7 +159,7 @@ python train.py -s <scene> -m <scene>/feature_pretrain --speedup --iterations 30
 **Step-2 input contract** — whatever the encoder, Step 2 only consumes:
 | asset | description |
 |-------|-------------|
-| `feature_pretrain/.../point_cloud.ply` | 3DGS with the 128-d semantic feature + branch/leaf label |
+| `feature_pretrain/.../point_cloud.ply` | 3DGS with the 128-d semantic feature (no label channel) |
 | `pretrain_clean/<scene>_clean_pruned.ply` | the same cloud, pot/background removed |
 | `dinov3_pca.pth`, `dinov3_text_feats.pth` | shared assets at `--root_path` |
 
