@@ -123,6 +123,9 @@ COLMAP capture plus a pretrained **feature 3DGS**:
 > - **Training uses no ground truth.** Step 2 is fully self-supervised (re-rendering
 >   loss against the images + feature pretrain). `point_cloud_branch_dense.ply` is read
 >   **only** by `eval_chamfer.py` to score the result.
+> - **`dinov3_text_feats.pth` (16 KB) ships in [`assets/`](assets/)** so the code works
+>   out of the box; the larger `dinov3_pca.pth` basis (3.4 MB, needed only for the main
+>   pipeline / Step-1a feature extraction) travels with the dataset.
 
 ---
 
@@ -224,6 +227,33 @@ branch fraction vary by plant):
 **Recommended defaults**
 - `--label_lr 0` **freezes** the branch/leaf labels at their joint-init values (init AUC ≈ 0.97; letting them drift degrades the skeleton).
 - Prefer `--densify_branch` (binding-driven, branch-only) over generic `--densify` (which follows photometric gradient and densifies **leaves**, not branches).
+
+---
+
+## Optional: semantic-only branch/leaf labelling
+
+`semantic_classify.py` is a small **standalone** helper that labels a *cleaned* cloud
+branch/leaf purely from the **DINOv3 text similarity** of each point's 128-d feature —
+**no colour, no geometry**. It exists for the case where the colour cue in the joint init
+fails (e.g. **yellow / autumn leaves**, or branch and leaf colours that are hard to tell
+apart).
+
+```shell
+python semantic_classify.py \
+  --ply /mnt/data/gaussianplant_data/pretrain_clean/<scene>_clean_pruned.ply \
+  --root_path /mnt/data/gaussianplant_data \
+  --branch_idx 1 --leaf_idx 0 --out output/semcls/<scene>
+```
+It writes a `*_label.ply` (branch probability), a red/green `*_color.ply`, and a 3-view
+`*_semcls.png`, and prints the branch fraction for every text-prompt pair (the prompt
+convention is undocumented, so try a few `--branch_idx/--leaf_idx`).
+
+> [!WARNING]
+> This is a **niche fallback, not the default path.** The pure text-similarity signal is
+> soft (per-point AUC ≈ 0.6–0.85, scene/prompt dependent). Use it **only on structurally
+> simple plants with almost no self-occlusion** — occlusion makes the per-point feature
+> unreliable. For normal scenes the joint init (colour + geometry + semantic) is far more
+> accurate; if only colour is the problem, prefer fixing the colour cue over this.
 
 ---
 
