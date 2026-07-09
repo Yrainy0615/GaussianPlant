@@ -101,7 +101,10 @@ class Scene:
         # projected with this exact 768->128 PCA, so any new scene's DINOv3 features must be
         # projected with the SAME basis in Step-1a to stay aligned with the text features.
         # It therefore has to be released alongside the dataset (see README Step 1a).
+        _assets = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
         pca_path = os.path.join(args.root_path, 'dinov3_pca.pth')
+        if not os.path.exists(pca_path):
+            pca_path = os.path.join(_assets, 'dinov3_pca.pth')   # shipped fallback
         if os.path.exists(pca_path):
             pca_checkpoint = torch.load(pca_path, map_location='cpu')
             gaussians.pca = pca_checkpoint['pca']
@@ -111,8 +114,7 @@ class Scene:
         # Ships in assets/ so the code works out of the box; prefer a copy at root_path.
         tf_path = os.path.join(args.root_path, "dinov3_text_feats.pth")
         if not os.path.exists(tf_path):
-            tf_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                   "assets", "dinov3_text_feats.pth")
+            tf_path = os.path.join(_assets, "dinov3_text_feats.pth")
         text_checkpoints = torch.load(tf_path, map_location='cpu')
         gaussians.text_feats = text_checkpoints['text_feats_dim128'][:3,].to(args.data_device)  # [stem,leaf]
         gaussians.text_feats_fgbg = text_checkpoints['text_feats_dim128'][2:,].to(args.data_device)  # [background, plant]
