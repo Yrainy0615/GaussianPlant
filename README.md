@@ -123,9 +123,10 @@ COLMAP capture plus a pretrained **feature 3DGS**:
 > - **Training uses no ground truth.** Step 2 is fully self-supervised (re-rendering
 >   loss against the images + feature pretrain). `point_cloud_branch_dense.ply` is read
 >   **only** by `eval_chamfer.py` to score the result.
-> - **`dinov3_text_feats.pth` (16 KB) ships in [`assets/`](assets/)** so the code works
->   out of the box; the larger `dinov3_pca.pth` basis (3.4 MB, needed only for the main
->   pipeline / Step-1a feature extraction) travels with the dataset.
+> - **The semantic assets ship in [`assets/`](assets/)** so the code works out of the box:
+>   `dinov3_text_feats.pth` (16 KB, branch/leaf/bg text prompts) and `dinov3_pca.pth`
+>   (3.4 MB, the 1024→768→128 PCA basis). The PCA basis is **required for Step-1a** to
+>   project new features into the same 128-d space as the text prompts (see Step 1a).
 
 ---
 
@@ -143,9 +144,20 @@ COLMAP capture plus a pretrained **feature 3DGS**:
 The 2D semantic features distilled in Step 1b are produced offline (not by Feature-3DGS's
 built-in LSeg/SAM encoders). Recommended: extract patch features with a **DINO / DINOv3**
 backbone, upsample to full resolution with **[JaFAR](https://github.com/PaulCouairon/JaFAR)**
-(a learned feature upsampler) for dense, edge-aligned per-pixel maps, PCA-reduce to
-**128-d**, and write one map per view under `<scene>/dinov3_dim128/`. Keep this as your own
+(a learned feature upsampler) for dense, edge-aligned per-pixel maps, project to **128-d**,
+and write one map per view under `<scene>/dinov3_dim128/`. Keep this as your own
 preprocessing script — this repo intentionally does not ship it.
+
+> [!IMPORTANT]
+> **Use the provided PCA basis for the 128-d projection — don't fit your own.** The
+> branch/leaf **text** features shipped in [`assets/`](assets/) were reduced to 128-d with
+> the exact basis in [`assets/dinov3_pca.pth`](assets/dinov3_pca.pth) (`pca`: 1024→768,
+> `pca128`: 768→128). Your per-view visual features must be projected with the **same**
+> basis, otherwise the visual and text features live in different 128-d subspaces and the
+> semantic cue (`get_semantic_prior`, the joint-init semantic term) is meaningless. Apply
+> it as `feat128 = pca128.transform(pca.transform(feat1024))` (or just `pca128.transform`
+> if your backbone already outputs 768-d). Verified: `pca128.transform(text_768)` reproduces
+> the shipped `text_feats_dim128` exactly.
 
 **1b · Distillation** — *via the Feature-3DGS submodule.*
 Handled by upstream [Feature-3DGS](https://github.com/ShijieZhou-UCLA/feature-3dgs) at

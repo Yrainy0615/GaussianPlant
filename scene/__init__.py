@@ -94,13 +94,28 @@ class Scene:
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
         
-        # load pca and text feats
-        pca_checkpoint = torch.load(os.path.join(args.root_path, 'dinov3_pca.pth'), map_location='cpu')
-        text_checkpoints = torch.load(os.path.join(args.root_path, "dinov3_text_feats.pth"), map_location='cpu')
+        # --- PCA basis (dinov3_pca.pth): optional HERE, but required for PREPROCESSING ---
+        # Step-2 training never *applies* it (semantic features arrive already reduced to
+        # 128-d), so the load is optional and we skip gracefully if absent. IMPORTANT: the
+        # basis is NOT disposable — the shipped text features (text_feats_dim128) were
+        # projected with this exact 768->128 PCA, so any new scene's DINOv3 features must be
+        # projected with the SAME basis in Step-1a to stay aligned with the text features.
+        # It therefore has to be released alongside the dataset (see README Step 1a).
+        pca_path = os.path.join(args.root_path, 'dinov3_pca.pth')
+        if os.path.exists(pca_path):
+            pca_checkpoint = torch.load(pca_path, map_location='cpu')
+            gaussians.pca = pca_checkpoint['pca']
+            gaussians.pca_low = pca_checkpoint['pca128']
+
+        # --- text features (branch/leaf/bg prompts, already 128-d): REQUIRED ---
+        # Ships in assets/ so the code works out of the box; prefer a copy at root_path.
+        tf_path = os.path.join(args.root_path, "dinov3_text_feats.pth")
+        if not os.path.exists(tf_path):
+            tf_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                   "assets", "dinov3_text_feats.pth")
+        text_checkpoints = torch.load(tf_path, map_location='cpu')
         gaussians.text_feats = text_checkpoints['text_feats_dim128'][:3,].to(args.data_device)  # [stem,leaf]
         gaussians.text_feats_fgbg = text_checkpoints['text_feats_dim128'][2:,].to(args.data_device)  # [background, plant]
-        gaussians.pca = pca_checkpoint['pca']
-        gaussians.pca_low = pca_checkpoint['pca128']
         
         if self.loaded_iter:
             # keep first two / in self.model_path 
