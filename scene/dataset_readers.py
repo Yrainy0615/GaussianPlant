@@ -115,7 +115,9 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
         mask_path = os.path.join(mask_folder, f"{extr.name[:-n_remove]}.JPG") if mask_folder != "" else ""
-        if not os.path.exists(mask_path):
+        # only skip for a MISSING mask when masks were actually requested; with no mask folder
+        # (mask_path == "") keep the view (background removal happens later at Stage 2).
+        if mask_folder != "" and not os.path.exists(mask_path):
             print(f"\nSkipping {image_name}: mask not found at {mask_path}")
             continue
         branch_path = os.path.join(branch_folder, f"{extr.name[:-n_remove]}.JPG") if mask_folder != "" else ""

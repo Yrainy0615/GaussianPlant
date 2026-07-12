@@ -1,3 +1,4 @@
+import os
 #
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
@@ -22,8 +23,6 @@ WARNED = False
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     image = Image.open(cam_info.image_path)
     image = ImageOps.exif_transpose(image)
-    # print("Loading branch:", cam_info.branch_path)
-    branch = Image.open(cam_info.branch_path)
     mask_binary = None
     if cam_info.mask_path != "":
         mask = Image.open(cam_info.mask_path).convert('L')
@@ -77,7 +76,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
     gt_feature_map = cam_info.semantic_feature
     return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap, mask=mask_binary, semantic_feature=gt_feature_map, branch=branch,
+                  image=image, invdepthmap=invdepthmap, mask=mask_binary, semantic_feature=gt_feature_map,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
 

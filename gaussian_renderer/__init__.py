@@ -63,7 +63,7 @@ def _rasterize(viewpoint_camera, means, quats, scales, opacities, colors,
         packed=False,
         absgrad=False,
     )
-    return out, info
+    return out, _alphas, info
 
 
 # --------------------------------------------------------------------------- #
@@ -89,7 +89,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
     means, quats, scales, opacities, colors, sh_degree = _prepare(pc, override_color)
 
     # RGB + expected depth
-    out, info = _rasterize(viewpoint_camera, means, quats, scales, opacities,
+    out, _al, info = _rasterize(viewpoint_camera, means, quats, scales, opacities,
                            colors, bg_color, sh_degree, render_mode="RGB+ED")
     rgb = out[0, ..., :3].permute(2, 0, 1)      # [3,H,W]
     depth = out[0, ..., 3:4].permute(2, 0, 1)   # [1,H,W]
@@ -105,7 +105,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
     if sem is not None and sem.numel() > 0:
         feats = sem.squeeze(1)                   # [N, D]
         fbg = torch.zeros(feats.shape[1], device=feats.device)
-        fout, _ = _rasterize(viewpoint_camera, means, quats, scales, opacities,
+        fout, _, _ = _rasterize(viewpoint_camera, means, quats, scales, opacities,
                              feats, fbg, sh_degree=None, render_mode="RGB")
         feature_map = fout[0].permute(2, 0, 1)   # [D,H,W]
 
@@ -121,9 +121,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
 
 def _render_with_opacity(viewpoint_camera, pc, means, quats, scales, opacities,
                          colors, bg_color, sh_degree):
-    out, _ = _rasterize(viewpoint_camera, means, quats, scales, opacities,
+    out, alpha, _ = _rasterize(viewpoint_camera, means, quats, scales, opacities,
                         colors, bg_color, sh_degree, render_mode="RGB")
-    return out[0, ..., :3].permute(2, 0, 1)
+    return out[0, ..., :3].permute(2, 0, 1), alpha[0].permute(2, 0, 1)   # rgb [3,H,W], alpha [1,H,W]
 
 
 def render_gsplant(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
@@ -144,13 +144,15 @@ def render_gsplant(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Te
         if render_only_leaf:
             op = torch.full_like(opacities, 1e-6)
             op[leaf_mask] = opacities[leaf_mask]
-            rendered_leaf = _render_with_opacity(viewpoint_camera, pc, means, quats,
+            rendered_leaf, leaf_alpha = _render_with_opacity(viewpoint_camera, pc, means, quats,
                                                  scales, op, colors, bg_color, sh_degree)
+            pkg["leaf_alpha"] = leaf_alpha        # [1,H,W] branch-excluded coverage
         if render_only_branch:
             op = torch.full_like(opacities, 1e-6)
             op[branch_mask] = opacities[branch_mask]
-            rendered_branch = _render_with_opacity(viewpoint_camera, pc, means, quats,
+            rendered_branch, branch_alpha = _render_with_opacity(viewpoint_camera, pc, means, quats,
                                                    scales, op, colors, bg_color, sh_degree)
+            pkg["branch_alpha"] = branch_alpha    # [1,H,W] leaf-excluded coverage
     return pkg, rendered_leaf, rendered_branch
 
 
@@ -202,7 +204,7 @@ def render_edit(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tenso
         colors[:, 0, :] = colors[:, 0, :] * (1 - scores[:, None]) + \
             op_dict["color_func"](colors[:, 0, :]) * scores[:, None]
 
-    out, info = _rasterize(viewpoint_camera, means, quats, scales, opacities,
+    out, _al, info = _rasterize(viewpoint_camera, means, quats, scales, opacities,
                            colors, bg_color, sh_degree, render_mode="RGB+ED")
     radii = _radii_to_scalar(info["radii"])
     return {
@@ -227,7 +229,7 @@ def render_dynamic(viewpoint_camera, pc: GaussianModel, pipe, nn_stpr_app, bg_co
         if i in leaf_index:
             op = opacities.clone()
             op[parent_id == i] = 1e-6
-            img = _render_with_opacity(viewpoint_camera, pc, means, quats, scales,
-                                       op, colors, bg_color, sh_degree).clamp(0, 1)
-            image_list.append(img)
+            img, _ = _render_with_opacity(viewpoint_camera, pc, means, quats, scales,
+                                       op, colors, bg_color, sh_degree)
+            image_list.append(img.clamp(0, 1))
     return image_list

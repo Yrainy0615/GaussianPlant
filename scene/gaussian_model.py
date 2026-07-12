@@ -470,6 +470,29 @@ class GaussianModel:
         self.strprs.label.data[bidx[drop]] = torch.logit(torch.tensor(leaf_p, device=self.strprs.label.device))
         return int(drop.sum())
 
+    def prune_large_scale(self, extent=None, scale_frac=0.15, opacity_below=None):
+        """Remove degenerate low-frequency StrPr whose world-space max scale exceeds
+        scale_frac * plant_extent. A sparse StrPr set tends to grow a few huge, faint
+        'ambient wash' Gaussians to cheaply explain the plant interior's low frequencies;
+        their CENTRES sit inside the plant, so the 2D photometric mask never excludes them,
+        and nothing else caps world scale (size/overlap regularisers were dropped). Prune by
+        geometry instead. Optionally also require low opacity (opacity_below) to be conservative.
+        The appgas->StrPr binding is recomputed every step, so removing StrPr points is safe.
+        plant_extent is the StrPr bounding-box max side (self-calibrating to plant size); the
+        `extent` arg is only a fallback. Returns #pruned."""
+        xyz = self.strprs.get_xyz
+        plant_extent = (xyz.max(dim=0).values - xyz.min(dim=0).values).max().item()
+        if extent is not None:
+            plant_extent = max(plant_extent, 1e-6)
+        smax = self.strprs.get_scaling.max(dim=1).values
+        big = smax > scale_frac * plant_extent
+        if opacity_below is not None:
+            big = big & (self.strprs.get_opacity.squeeze(-1) < opacity_below)
+        n = int(big.sum())
+        if n > 0:
+            self.strprs.prune_points(big)
+        return n
+
     def prune_isolated_branches(self, iso_factor=2.5, k=3, scale_min=0.001, leaf_p=0.3, max_frac=0.25,
                                 len_weight=0.0, turn_weight=0.0):
         """Demote spatially-isolated ("floating") branch StrPrs to leaf. True branches form a
@@ -544,11 +567,12 @@ class GaussianModel:
         return s, valid
 
     def get_semantic_prior(self, visual_feats=None):
-        text_feats = F.normalize(self.text_feats, dim=-1)      # [2, dim]
+        text_feats = F.normalize(self.text_feats, dim=-1)      # [P, dim] (index 0=leaf, 1=branch)
         if visual_feats is None:
             visual_feats = F.normalize(self._semantic_feature.squeeze(1), dim=-1)  # [N, dim]
         else:
             visual_feats = F.normalize(visual_feats.squeeze(1), dim = -1)
+        text_feats = text_feats.to(visual_feats.device)       # device-safe (cpu data_device)
 
         branch_text, leaf_text = text_feats[1], text_feats[0]  # assume index 0=leaf, 1=branch
         # Cosine similarities
@@ -1051,7 +1075,7 @@ class GaussianModel:
 
         # ---- 3) Cosine scores -> softmax probabilities (semantic prior) ----
         # scores[:,0]=leaf, scores[:,1]=branch
-        scores = strpr_feat @ text.T                            # (S, 2)
+        scores = strpr_feat @ text.to(strpr_feat.device).T                            # (S, 2)
         logits = scores / tau
         probs = F.softmax(logits, dim=-1)                       # (S, 2)
 
@@ -1716,7 +1740,7 @@ class GaussianModel:
         mask_nonempty = (cnt > 0)
         if mask_nonempty.any():
             f_strpr[mask_nonempty] = F.normalize(f_strpr[mask_nonempty], dim=-1)
-        text = F.normalize(self.text_feats[:2], dim=-1)            # (2,D)
+        text = F.normalize(self.text_feats[:2].to(f_strpr.device), dim=-1)   # (2,D) device-safe
         scores = f_strpr @ text.T                              # (S,2), cos(f_strpr, t_c)
         logits = scores / tau
         pi = F.softmax(logits, dim=-1)             

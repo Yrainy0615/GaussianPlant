@@ -17,8 +17,8 @@ from utils.general_utils import PILtoTorch
 import cv2
 
 class Camera(nn.Module):
-    def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap, mask, semantic_feature, branch,
-                 image_name, uid, 
+    def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap, mask, semantic_feature,
+                 image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  train_test_exp = False, is_test_dataset = False, is_test_view = False
                  ):
@@ -42,7 +42,6 @@ class Camera(nn.Module):
             self.data_device = torch.device("cuda")
 
         resized_image_rgb = PILtoTorch(image, resolution)
-        resized_branch_rgb = PILtoTorch(branch, resolution)
         gt_image = resized_image_rgb[:3, ...]
         resized_mask_rgb = None
         if mask is not None:
@@ -67,7 +66,6 @@ class Camera(nn.Module):
         self.image_height = self.original_image.shape[1]
         self.mask = resized_mask_rgb
         self.invdepthmap = None
-        self.branch = resized_branch_rgb.clamp(0.0, 1.0).to(self.data_device)
         self.depth_reliable = False
         if invdepthmap is not None:
             self.depth_mask = torch.ones_like(self.alpha_mask)

@@ -155,6 +155,15 @@ class Scene:
             branch_pd = o3d.geometry.PointCloud()
             branch_pd.points = o3d.utility.Vector3dVector(appgas_branch_points.detach().cpu().numpy())
             o3d.io.write_point_cloud(os.path.join(point_cloud_path, "branch.ply"), branch_pd)
+
+            # AppGS classified as branch (bound to a branch StrPr), saved WITH full gaussian
+            # attributes (colour/scale/opacity) so it is viewable/editable -- branch.ply above only
+            # has XYZ. Same points build_branch_graph used for branch.ply.
+            if self.gaussians.appgas is not None and self.gaussians.nn_stpr_appgas is not None:
+                scale_mask = self.gaussians.strprs.get_scaling.max(dim=1).values > 0.001
+                appgas_branch_mask = (branch_mask & scale_mask)[self.gaussians.nn_stpr_appgas.squeeze(1)]
+                self.gaussians.appgas.save_branch_ply(
+                    os.path.join(point_cloud_path, "appgas_branch.ply"), appgas_branch_mask)
         if self.gaussians.appgas is not None and not os.path.exists(os.path.join(point_cloud_path, "appgas.ply")):
             self.gaussians.appgas.save_ply(os.path.join(point_cloud_path, "appgas.ply"))
 
