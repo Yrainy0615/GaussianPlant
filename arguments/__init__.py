@@ -104,8 +104,6 @@ class OptimizationParams(ParamGroup):
         self.lambda_bind = 0.1
         self.lambda_align = 0.1
         self.lambda_axis = 1.0    # branch StrPr long-axis -> branch-tangent alignment
-        self.lambda_branch_photo = 0.5  # branch-only photometric: match branch StrPr render to AppGS in branch-alpha coverage
-        self.lambda_scale_hinge = 5.0   # one-sided penalty on StrPr world scale ABOVE prune_scale_frac*extent (suppress ambient-wash blobs)
         self.lambda_sem = 0.001
         self.lambda_col = 1.0     # L_col: pull StrPr label toward (fixed) color-consistent class
         self.lambda_conf = 0.05   # L_conf: p(1-p) confidence (deprecated; collapses -> not wired)

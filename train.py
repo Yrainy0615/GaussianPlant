@@ -188,35 +188,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         if args.reg_axis and iteration > args.densify_from_iter:
             loss_axis = gaussians_pretrain.compute_branch_axis_alignment()
 
-        # --- Branch-only photometric: give branch StrPr a dedicated appearance/stretch gradient ---
-        # In the joint render_strpr the ~100 thin branch StrPr are drowned by the leaf StrPr and get
-        # almost no photometric signal, so their appearance is never optimised and they stay as small
-        # unstretched blobs. Supervise the branch-ONLY render against the AppGS teacher, restricted to
-        # the branch-alpha coverage (where branch StrPr actually paint), within the plant mask. This
-        # updates branch StrPr xyz/scale/rot/colour only; it does NOT feed densification.
-        loss_branch_photo = torch.tensor(0.0, device="cuda")
-        if args.reg_branch_photo and render_branch_strpr is not None \
-                and "branch_alpha" in render_pkg_strpr:
-            bcov = (render_pkg_strpr["branch_alpha"].detach() * mask)   # [1,H,W] coverage x plant
-            loss_branch_photo = l1_loss(render_branch_strpr * bcov,
-                                        render_appgas.detach() * bcov)
-
-        # --- One-sided world-scale hinge: continuously shrink any StrPr whose max scale exceeds
-        # prune_scale_frac * plant extent. Unlike a plain size/overlap penalty (which collapsed
-        # leaves into needles), this is a HINGE that is exactly zero below the threshold, so normal
-        # leaf disks are untouched; it only bites the degenerate ambient-wash blobs, preventing them
-        # from regrowing between prune events. ---
-        loss_scale_hinge = torch.tensor(0.0, device="cuda")
-        if args.prune_large_scale and opt.lambda_scale_hinge > 0:
-            sxyz = strpr.get_xyz
-            pext = (sxyz.max(0).values - sxyz.min(0).values).max().detach()
-            smax = strpr.get_scaling.max(dim=1).values
-            loss_scale_hinge = torch.relu(smax - args.prune_scale_frac * pext).mean()
-
         total_loss = (loss + opt.lambda_bind * bind_loss
                       + opt.lambda_axis * loss_axis
-                      + opt.lambda_branch_photo * loss_branch_photo
-                      + opt.lambda_scale_hinge * loss_scale_hinge
                       + opt.lambda_graph * loss_graph + opt.lambda_sem * reg_semantic)
         total_loss.backward()
 
@@ -421,15 +394,12 @@ if __name__ == "__main__":
                         help="periodically delete StrPr whose world max-scale > prune_scale_frac * "
                              "scene extent (removes the low-frequency ambient-wash blobs the 2D mask "
                              "cannot catch)")
-    parser.add_argument("--prune_scale_frac", type=float, default=0.15,
-                        help="world-scale prune threshold as a fraction of scene (cameras) extent")
-    parser.add_argument("--prune_scale_opacity", type=float, default=0.0,
-                        help="if >0, only prune oversized StrPr whose opacity is below this (conservative)")
-    parser.add_argument("--reg_branch_photo", action="store_true", default=False,
-                        help="branch-only photometric loss: supervise the branch-only StrPr render "
-                             "against AppGS within the branch-alpha coverage, so branch StrPr get a "
-                             "dedicated appearance/stretch gradient (not drowned in the joint render). "
-                             "Does NOT affect densification.")
+    parser.add_argument("--prune_scale_frac", type=float, default=0.2,
+                        help="world-scale prune threshold as a fraction of the plant bounding box")
+    parser.add_argument("--prune_scale_opacity", type=float, default=0.15,
+                        help="only prune oversized StrPr whose opacity is below this, so real (opaque) "
+                             "leaf disks are protected and only faint ambient-wash blobs are removed; "
+                             "set 0 to prune purely by scale")
     parser.add_argument("--reg_cls", action="store_true", default=False,
                         help="colour-contrast + confidence loss to binarise branch/leaf labels")
     parser.add_argument("--reg_sem", action="store_true", default=False)
