@@ -390,7 +390,7 @@ if __name__ == "__main__":
     parser.add_argument("--reg_axis", action="store_true", default=False,
                         help="align each branch StrPr's long axis along the local branch direction")
     parser.add_argument("--reg_bind", action="store_true", default=False)
-    parser.add_argument("--prune_large_scale", action="store_true", default=False,
+    parser.add_argument("--prune_large_scale", action="store_true", default=True,
                         help="periodically delete StrPr whose world max-scale > prune_scale_frac * "
                              "scene extent (removes the low-frequency ambient-wash blobs the 2D mask "
                              "cannot catch)")
