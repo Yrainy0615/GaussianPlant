@@ -27,6 +27,7 @@
 ## Contents
 
 - [Installation](#installation)
+- [Dataset](#dataset)
 - [Data layout](#data-layout)
 - [Pipeline](#pipeline)
   - [Step 1 — Feature 3DGS pretraining](#step-1--feature-3dgs-pretraining)
@@ -89,6 +90,16 @@ print('torch', torch.__version__, 'gsplat', gsplat.__version__, 'cuda', torch.cu
 > uses the [Feature-3DGS](https://github.com/ShijieZhou-UCLA/feature-3dgs) submodule,
 > which has its **own** conda env (`feature_3dgs`, py3.8 / cu118) and rasterizer — set it
 > up separately, and only if you intend to (re)run Step 1.
+
+---
+
+## Dataset
+
+A dataset is provided separately and should be downloaded from the shared Google Drive folder below:
+
+**Download link:** https://drive.google.com/drive/folders/12X6jU1ZrLO_QvD8X5ACeypJwc4HZQQrV
+
+After downloading, place the contents under `--root_path` so the directory structure matches the layout described in [Data layout](#data-layout).
 
 ---
 
@@ -228,7 +239,7 @@ branch fraction vary by plant):
 
 | flag | default | what it controls / when to change |
 |------|:-------:|-----------------------------------|
-| `--branch_frac` | `-1` (auto) | Fraction of StrPr labelled **branch**. `-1` auto-calibrates via Otsu (capped 0.15). **The one knob that doesn't always auto-generalise:** when branches are a small minority, Otsu over-estimates and hits the cap, labelling leaves as branch (symptom: high `pred2gt`/`ctr2gt`, false cylinders on foliage). Set manually `0.03`–`0.18` (e.g. newplant5 ≈ 0.05). |
+| `--branch_frac` | `-1` (auto) | Fraction of StrPr labelled **branch**. `-1` auto-calibrates via Otsu (capped 0.15). **The one knob that doesn't always auto-generalise:** when branches are a small mi[...]
 | `--cluster_size` | `40` | Avg points per StrPr cluster → StrPr **count / granularity**. Smaller = more, finer StrPr. |
 | `--prune_iso_factor` | `2.5` | Isolation pruning: demote a branch StrPr whose distance to its k-th nearest branch > `median × factor`. Lower → prune floaters harder. |
 | `--branch_split_ratio` | `1.5` | Branch densification: split a branch StrPr when its bound AppGS spill `> ratio × cylinder length`. Lower → finer skeleton. |
