@@ -43,6 +43,57 @@ except:
     pass
 
 
+def path_traffic(xyz, up, k=10, pool=100, nbins=60, return_width=False):
+    """Geodesic 'path traffic' branch cue (plant-agnostic, colour-free).
+
+    Every path from the stem base to a leaf has to run through the branches. Build a kNN graph
+    on the plant points, take the shortest-path tree from the root (the lowest point along the
+    camera up vector, in the largest connected component), and score each point by log(subtree
+    size) = how many points are reached through it. Max-pooled over `pool` neighbours so a
+    branch's whole cross-section inherits its centre-line value. Point-level AUC vs GT branch
+    on newplant1-10: 0.95 mean, 0.88 min (colour: 0.76 mean, 0.41 on Monstera).
+    Returns a (N,) numpy array (unreachable points get 0). With return_width, also returns the
+    geodesic slice width: points are binned by distance-to-root, each connected piece of a bin is
+    a cross-section, and its width is 2x the RMS radius (thin for branches, wide for leaf blades)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import dijkstra, connected_components
+    X = np.asarray(xyz, dtype=np.float64)
+    n = X.shape[0]
+    tree = cKDTree(X)
+    d, idx = tree.query(X, k + 1)
+    G = coo_matrix((d[:, 1:].ravel(), (np.repeat(np.arange(n), k), idx[:, 1:].ravel())), shape=(n, n)).tocsr()
+    G = G.maximum(G.T)
+    _, comp = connected_components(G, directed=False)
+    cand = np.where(comp == np.bincount(comp).argmax())[0]
+    root = cand[np.argmin(X[cand] @ np.asarray(up, dtype=np.float64))]
+    dist, pred = dijkstra(G, directed=False, indices=root, return_predecessors=True)
+    reach = np.isfinite(dist)
+    sub = np.ones(n)
+    for v in np.argsort(-np.where(reach, dist, -1.0)):
+        if not reach[v] or v == root:
+            continue
+        if pred[v] >= 0:
+            sub[pred[v]] += sub[v]
+    t = np.where(reach, np.log(sub), 0.0)
+    _, nb = tree.query(X, min(pool, n))
+    if not return_width:
+        return t[nb].max(axis=1)
+    width = np.zeros(n)
+    b = np.where(reach, (dist / (dist[reach].max() / nbins + 1e-12)).astype(np.int64), -1)
+    Gc = G.tocoo()
+    same = (b[Gc.row] == b[Gc.col]) & (b[Gc.row] >= 0)
+    H = coo_matrix((np.ones(same.sum()), (Gc.row[same], Gc.col[same])), shape=(n, n))
+    _, sl = connected_components(H, directed=False)
+    order = np.argsort(sl)
+    bounds = np.r_[0, np.flatnonzero(np.diff(sl[order])) + 1, n]
+    for a, e in zip(bounds[:-1], bounds[1:]):
+        ids = order[a:e]
+        if len(ids) > 1:
+            P = X[ids]
+            width[ids] = 2 * np.sqrt(((P - P.mean(0)) ** 2).sum(1).mean())
+    return t[nb].max(axis=1), width
+
+
 def _otsu_threshold(score, bins=256):
     """Otsu's threshold on a 1D score: the value maximising between-class variance, i.e. the
     valley between the (minority, high-score) branch mode and the (majority, low-score) leaf
@@ -347,7 +398,8 @@ class GaussianModel:
         semantic_feature = np.stack([np.asarray(plydata.elements[0][f"semantic_{i}"]) for i in range(count)], axis=1) 
         semantic_feature = np.expand_dims(semantic_feature, axis=-1)
         try:
-            label = np.stack([np.asarray(plydata.elements[0][f"label_{i}"]) for i in range(count)], axis=1)
+            n_label = sum(1 for name in plydata.elements[0].data.dtype.names if name.startswith("label_"))
+            label = np.stack([np.asarray(plydata.elements[0][f"label_{i}"]) for i in range(n_label)], axis=1)
         except:
             label = np.zeros((xyz.shape[0], 1), dtype=np.float32)
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
@@ -794,12 +846,14 @@ class GaussianModel:
         n_points = len(point_idx)
         
         # Decide whether we want to propagate the gradient to the points only, or to the points and the covariance parameters
+        # NOTE: use the activated scale (get_scaling). The raw log-scale _scaling was used here
+        # before, which gives negative/inverted "scales" and streaked StrPr into needles.
         if propagate_gradient_to_points_only:
-            scaling = self._scaling[branch_mask].detach()
-            quaternions = self._rotation[branch_mask].detach()
+            scaling = self.get_scaling[branch_mask].detach()
+            quaternions = self.get_rotation[branch_mask].detach()
         else:
-            scaling = self._scaling[branch_mask]
-            quaternions = self._rotation[branch_mask]
+            scaling = self.get_scaling[branch_mask]
+            quaternions = self.get_rotation[branch_mask]
         
         # Samples points in the corresponding gaussians
         if use_gaussian_center_only:
@@ -1088,10 +1142,14 @@ class GaussianModel:
         self.strprs.rewrite_semantic_feature(strpr_feat.detach().unsqueeze(1))
         return p_branch
 
-    def compute_binding_loss(self, compute_for_appgas=False, prior='geo', detach_label=False, disk_tol=3.0, normalize=True): # 'geo' or 'semantic'
+    def compute_binding_loss(self, compute_for_appgas=False, prior='geo', detach_label=False, disk_tol=3.0, normalize=True,
+                             appgas_grad_scale=1.0, paper_disk=False): # 'geo' or 'semantic'
         disk_params, cylinder_params, mesh_cylinder_list, mesh_disk_list = self.build_primitive_surface(compute_all=True, create_mesh=False)
         if compute_for_appgas:
             appgas_xyz = self.appgas._xyz
+            if appgas_grad_scale != 1.0:
+                # same value, gradient to AppGS scaled (paper: lambda_bind 0.1 for AppGS, 1 for StrPr)
+                appgas_xyz = appgas_xyz * appgas_grad_scale + appgas_xyz.detach() * (1.0 - appgas_grad_scale)
         else:
             appgas_xyz = self.appgas._xyz.detach()
         self.update_nn_between_appgas_and_stprs()
@@ -1102,7 +1160,7 @@ class GaussianModel:
         # Mesh disks keep their true size; this only affects the branch/leaf label signal.
         disk_bind = {**disk_params, 'a': disk_params['a'] * disk_tol, 'b': disk_params['b'] * disk_tol}
         dis_cylinder = gs_to_cylinder_distance(appgas_xyz, nn, cylinder_params)
-        dis_disk = gs_to_disk_distance(appgas_xyz, nn, disk_bind)
+        dis_disk = gs_to_disk_distance(appgas_xyz, nn, disk_bind, paper=paper_disk)
         label_for_prob = self.strprs.label.detach() if detach_label else self.strprs.label
         if prior == 'geo':
             prob = self.label_activation(label_for_prob)[nn].squeeze()
@@ -1199,6 +1257,59 @@ class GaussianModel:
         branch_appgas_mask = branch_mask[self.nn_stpr_appgas.squeeze(1)]
         appgas_branch_points = self.appgas.get_xyz[branch_appgas_mask]
         return mst_edges, p, appgas_branch_points
+
+    @torch.no_grad()
+    def filter_branches_radius(self, ratio=2.0, leaf_logit=-3.0):
+        """Paper (supp., branch StP filtering): along each parent->child edge of the branch MST the
+        radius should not grow; a child branch StrPr whose radius exceeds ratio x its parent's is a
+        misclassified leaf and is relabelled as leaf. The tree is rooted at the thickest StrPr (trunk).
+        Returns the number of relabelled StrPr."""
+        branch_mask, _, _ = self.get_cls_mask(label_threshold=0.5, mode='geo')
+        scale_mask = self.strprs.get_scaling.max(dim=1).values > 0.001
+        bm = torch.logical_and(branch_mask, scale_mask)
+        ids = torch.nonzero(bm).squeeze(1)
+        if ids.numel() < 3:
+            return 0
+        mst_edges, _, _ = self.build_branch_graph()
+        E = np.asarray(mst_edges.cpu() if torch.is_tensor(mst_edges) else mst_edges)
+        # geometric radius = median distance of the bound AppGS to the StrPr's major axis (the raw
+        # smallest scale collapses towards 0 and makes every child look "thicker" than its parent)
+        self.update_nn_between_appgas_and_stprs()
+        nn_ = self.nn_stpr_appgas.squeeze(1)
+        Rm = build_rotation(self.strprs.get_rotation)
+        major = self.strprs.get_scaling.argmax(dim=1)
+        axis = Rm[torch.arange(Rm.shape[0], device=Rm.device), :, major]
+        v = self.appgas.get_xyz - self.strprs.get_xyz[nn_]
+        d_ax = (v - (v * axis[nn_]).sum(-1, keepdim=True) * axis[nn_]).norm(dim=-1)
+        radius = np.full(Rm.shape[0], np.nan, dtype=np.float32)
+        nn_np, d_np = nn_.cpu().numpy(), d_ax.cpu().numpy()
+        order = np.argsort(nn_np)
+        groups = np.split(d_np[order], np.unique(nn_np[order], return_index=True)[1][1:])
+        radius[np.unique(nn_np[order])] = [np.median(g) for g in groups]
+        radius = radius[ids.cpu().numpy()]
+        radius = np.where(np.isnan(radius), np.nanmedian(radius), radius)
+        floor = 0.5 * np.median(radius)           # do not let one thin parent cascade to its subtree
+        G = nx.Graph()
+        G.add_nodes_from(range(len(ids)))
+        for a, b in E:
+            sa, sb = int(a) // 2, int(b) // 2
+            if sa != sb:
+                G.add_edge(sa, sb)
+        demote = []
+        for comp in nx.connected_components(G):
+            comp = list(comp)
+            root = comp[int(np.argmax(radius[comp]))]
+            ref = {root: radius[root]}                 # radius of the nearest kept ancestor
+            for parent, child in nx.bfs_edges(G, root):
+                if radius[child] > ratio * max(ref[parent], floor):
+                    demote.append(child)
+                    ref[child] = ref[parent]
+                else:
+                    ref[child] = radius[child]
+        if demote:
+            sel = ids[torch.tensor(demote, device=ids.device)]
+            self.strprs.label.data[sel] = leaf_logit
+        return len(demote)
 
     def densify_branches(self, ratio_thr=1.5, max_strpr_num=6000):
         """Structure-driven, BRANCH-ONLY densification: split a branch StrPr along its major axis
@@ -1369,6 +1480,10 @@ class GaussianModel:
         w_sem: float = 0.5,
         branch_frac: float = 0.08,
         cluster_size: int = 100,      # avg points per StrPr cluster (smaller -> finer/more StrPr)
+        up=None,                      # world up vector (from the cameras), for label_init with traffic
+        w_traffic: float = 2.0,
+        traffic_alpha: float = 0.04,  # label_init=traffic: branch if subtree >= alpha * #points
+        w_shape: float = 0.25,        # label_init=hybrid: weight of the shape cue vs traffic
     ):
         """
         Structural Primitives (StPrs) creation from optimized 2D Gaussian splats.
@@ -1424,6 +1539,17 @@ class GaussianModel:
             save_labeled_points(xyz.cpu().numpy(), labels, self.save_path)
 
 
+        need_traffic = label_init in ("traffic", "joint_traffic", "hybrid")
+        if need_traffic:
+            assert up is not None, "label_init with traffic needs the up vector"
+            if label_init == "hybrid":
+                t_np, w_np = path_traffic(xyz.cpu().numpy(), up, return_width=True)
+                w_pt = torch.as_tensor(w_np, dtype=torch.float32, device=xyz.device)
+                strpr_width, strpr_lin, strpr_pla = [], [], []
+            else:
+                t_np = path_traffic(xyz.cpu().numpy(), up)
+            t_pt = torch.as_tensor(t_np, dtype=torch.float32, device=xyz.device)
+            strpr_traffic = []
         for cluster_id in range(len(set(labels))):
             cluster_mask = [labels== cluster_id]
             cluster_points = xyz[cluster_mask]
@@ -1439,6 +1565,14 @@ class GaussianModel:
                 strpr_disk_rotations.append(rot_matrix_disk)
                 strpr_semantic_feature.append(self._semantic_feature[cluster_mask].mean(dim=0))
                 strpr_labels.append(self.get_semantic_prior(self._semantic_feature[cluster_mask]).mean())
+                if need_traffic:
+                    strpr_traffic.append(t_pt[cluster_mask].mean())
+                if label_init == "hybrid":
+                    # cluster PCA extents l0>=l1>=l2: linearity log(l0/l1), planarity log(l1/l2)
+                    ev = torch.linalg.eigvalsh(torch.cov(cluster_points.T.double())).flip(0).clamp_min(1e-12).sqrt()
+                    strpr_lin.append(torch.log(ev[0] / ev[1]).float())
+                    strpr_pla.append(torch.log(ev[1] / ev[2]).float())
+                    strpr_width.append(w_pt[cluster_mask].median())
         # Convert lists to tensors (GPU-friendly)
         strpr_positions = torch.stack(strpr_positions, dim=0).to(self.device)
         strpr_scales = self.scaling_inverse_activation(torch.stack(strpr_scales, dim=0)).to(self.device)
@@ -1461,10 +1595,26 @@ class GaussianModel:
         # complementary together. We standardise each across clusters and combine into a
         # single score, then map to a soft label in (0.4, 0.6) ordered by that score, so
         # the subsequent optimisation can move it freely. No hard threshold / per-scene tuning.
-        if label_init == "joint":
-            def _z(x):
-                x = x.flatten().float()
-                return (x - x.mean()) / (x.std() + 1e-6)
+        def _z(x):
+            x = x.flatten().float()
+            return (x - x.mean()) / (x.std() + 1e-6)
+        if label_init == "hybrid":
+            # HYBRID: the structural traffic rule decides (branch iff log subtree >= log(alpha*N)),
+            # a local shape cue only flips borderline StrPrs: branch = linear, not planar, thin
+            # geodesic cross-section. Colour is left out on purpose (inverted on green-petiole
+            # Monstera). StrPr-level F1 vs GT on newplant1-10: traffic 0.783 -> 0.788 mean,
+            # 0.60 -> 0.64 worst scene.
+            raw = torch.stack(strpr_traffic).to(self.device)
+            base = (raw - math.log(traffic_alpha * xyz.shape[0])) / (raw.std() + 1e-6)
+            ext = (torch.quantile(xyz, 0.98, dim=0) - torch.quantile(xyz, 0.02, dim=0)).max()
+            shape = _z(torch.stack(strpr_lin)) - _z(torch.stack(strpr_pla)) \
+                - _z(torch.log(torch.stack(strpr_width).to(self.device) / ext + 1e-6))
+            score = base + w_shape * shape.to(self.device) / (shape.std() + 1e-6)
+            thr = torch.tensor(0.0, device=self.device)
+            print(f"[GSplantModel] hybrid branch_frac = {(score > 0).float().mean().item():.3f} "
+                  f"(traffic-only {(base > 0).float().mean().item():.3f}, alpha {traffic_alpha}, w_shape {w_shape})")
+            strpr_labels = (0.40 + 0.20 * torch.sigmoid(2.0 * (score - thr))).unsqueeze(1)
+        elif label_init in ("joint", "traffic", "joint_traffic"):
             # color is by far the strongest cue for plants (green leaves vs brown branches,
             # AUC ~0.89) — branch-ness == NOT green. Geometry/semantics are weaker complements.
             rgb = 0.2820948 * strpr_features_dc.squeeze(1) + 0.5      # SH DC -> approx base color
@@ -1472,11 +1622,29 @@ class GaussianModel:
             z_col = _z(-greenness)                                    # high => branch (not green)
             z_geo = _z(torch.log(strpr_anisotropy.clamp_min(1e-6)))   # geometry: cluster elongation
             z_sem = _z(strpr_sem_prior)                              # semantics: DINOv3 text prior
-            score = w_col * z_col + w_geo * z_geo + w_sem * z_sem
+            if label_init == "joint":
+                score = w_col * z_col + w_geo * z_geo + w_sem * z_sem
+            else:
+                z_tr = _z(torch.stack(strpr_traffic).to(self.device))   # geodesic path traffic
+                if label_init == "traffic":
+                    score = z_tr
+                else:   # traffic dominant, colour/geometry/semantics as weaker complements
+                    score = w_traffic * z_tr + 0.5 * (w_col * z_col + w_geo * z_geo + w_sem * z_sem)
             # Branches are the minority; centre the 0.5 crossing so ~branch_frac start as branch.
             # branch_frac <= 0 -> AUTO-calibrate the threshold by Otsu on the score distribution
             # (the brown/elongated branch mode vs the green/planar leaf mode), no per-scene tuning.
-            if branch_frac is None or branch_frac <= 0:
+            if label_init == "traffic" and (branch_frac is None or branch_frac <= 0):
+                # AUTO (structural): a StrPr is branch when, on average, its points carry at least
+                # traffic_alpha of the whole plant downstream of them (log subtree >= log(alpha*N)).
+                # Scene-adaptive branch fraction (0.06-0.30 across newplant1-10) with one global
+                # constant, instead of a quantile/Otsu split capped at 0.15.
+                raw = torch.stack(strpr_traffic).to(self.device)
+                thr_raw = math.log(traffic_alpha * xyz.shape[0])
+                score = raw - thr_raw
+                thr = torch.tensor(0.0, device=self.device)
+                print(f"[GSplantModel] traffic branch_frac = {(score > 0).float().mean().item():.3f} "
+                      f"(alpha {traffic_alpha})")
+            elif branch_frac is None or branch_frac <= 0:
                 # AUTO: Otsu valley on the score, capped at auto_cap (branches are a minority;
                 # Otsu's balanced split tends to over-estimate when the score is not cleanly
                 # bimodal, so cap it). Adaptive pruning then trims residual over-estimates.
@@ -1516,6 +1684,315 @@ class GaussianModel:
         print(f"[GSplantModel] Initialized {len(strpr_positions)} StrPrs.")
         return self.strprs
     
+    @torch.no_grad()
+    # ------------------------------------------------------------------------------------------ #
+    #  Periodic structure consolidation (heuristic StP maintenance between optimisation phases)    #
+    # ------------------------------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _strpr_bound_count(self):
+        self.update_nn_between_appgas_and_stprs()
+        nn_ = self.nn_stpr_appgas.squeeze(1)
+        return torch.bincount(nn_, minlength=self.strprs.get_xyz.shape[0]), nn_
+
+    @torch.no_grad()
+    def _plant_extent(self):
+        a = self.appgas.get_xyz
+        lo = torch.quantile(a, 0.02, dim=0); hi = torch.quantile(a, 0.98, dim=0)
+        return (hi - lo).max().item()
+
+    @torch.no_grad()
+    def prune_strpr_anomalies(self, min_bound=3, scale_frac=0.15):
+        """Delete StrPr that explain no geometry: fewer than min_bound AppGS bound to them (orphans;
+        the per-StrPr scale clamp cannot reach them, so these are the leaf disks that grow without
+        limit), or a world max-scale above scale_frac x the plant extent. Returns #deleted."""
+        st = self.strprs
+        cnt, _ = self._strpr_bound_count()
+        ext = self._plant_extent()
+        bad = (cnt < min_bound) | (st.get_scaling.max(dim=1).values > scale_frac * ext)
+        if bad.all():
+            return 0
+        n = int(bad.sum())
+        if n:
+            st.prune_points(bad)
+        return n
+
+    @torch.no_grad()
+    def merge_branch_strprs(self, cos_thr=0.95, gap_frac=0.25, perp_frac=0.15, radius_ratio=2.0, k=4):
+        """Merge pairs of branch StrPr that describe the same branch segment: (near-)parallel major
+        axes, collinear (centre offset perpendicular to the axis small w.r.t. the segment length),
+        overlapping or nearly touching along the axis, and of similar thickness. The pair is replaced
+        by ONE cylinder spanning both (the longer StrPr is kept and re-fitted, the other deleted).
+        Densification (photometric split, branch split, AppGS densify) produces many short
+        overlapping cylinders on one branch; they make the MST skeleton zig-zag and double-count
+        segments. Greedy: each StrPr takes part in at most one merge per call. Returns #merged."""
+        st = self.strprs
+        p = self.label_activation(st.label).squeeze(-1)
+        bidx = torch.nonzero((p > 0.5) & (st.get_scaling.max(dim=1).values > 0.001)).squeeze(1)
+        if bidx.numel() < 2:
+            return 0
+        c = st.get_xyz[bidx]; S = st.get_scaling[bidx]; Rm = build_rotation(st.get_rotation[bidx])
+        amax = S.argmax(dim=1)
+        ar = torch.arange(bidx.numel(), device=c.device)
+        u = Rm[ar, :, amax]                                        # major axis
+        h = 1.5 * S[ar, amax]                                      # half length (as build_branch_graph)
+        Ssort = S.sort(dim=1).values
+        r = 0.5 * (Ssort[:, 0] + Ssort[:, 1])                      # thickness ~ the two minor scales
+        kk = min(k + 1, bidx.numel())
+        nbr = torch.cdist(c, c).topk(kk, largest=False).indices[:, 1:]
+        I = ar[:, None].expand_as(nbr).reshape(-1); J = nbr.reshape(-1)
+        keep = I < J
+        I, J = I[keep], J[keep]
+        d = c[J] - c[I]
+        cosang = (u[I] * u[J]).sum(-1).abs()
+        t = (d * u[I]).sum(-1)
+        perp = (d - t[:, None] * u[I]).norm(dim=-1)
+        hs = h[I] + h[J]
+        gap = t.abs() - hs
+        rr = torch.maximum(r[I], r[J]) / torch.minimum(r[I], r[J]).clamp_min(1e-9)
+        ok = (cosang > cos_thr) & (perp < perp_frac * hs) & (gap < gap_frac * hs) & (rr < radius_ratio)
+        if not ok.any():
+            return 0
+        I, J, perp = I[ok], J[ok], perp[ok]
+        order = torch.argsort(perp)
+        used = torch.zeros(bidx.numel(), dtype=torch.bool, device=c.device)
+        drop = []
+        for o in order.tolist():
+            i, j = int(I[o]), int(J[o])
+            if used[i] or used[j]:
+                continue
+            used[i] = used[j] = True
+            if h[j] > h[i]:
+                i, j = j, i                                        # keep the longer one
+            uj = u[j] if (u[i] * u[j]).sum() >= 0 else -u[j]
+            un = F.normalize(h[i] * u[i] + h[j] * uj, dim=0)       # length-weighted mean axis
+            ends = torch.stack([c[i] + h[i] * u[i], c[i] - h[i] * u[i], c[j] + h[j] * uj, c[j] - h[j] * uj])
+            ts = ((ends - c[i]) * un).sum(-1)
+            tmin, tmax = ts.min(), ts.max()
+            gi = int(bidx[i]); gj = int(bidx[j])
+            # rotate StrPr i so its major axis becomes un (Rodrigues, minimal rotation u_i -> un)
+            ax = torch.cross(u[i], un, dim=0); s_ = ax.norm(); c_ = (u[i] * un).sum()
+            if s_ > 1e-8:
+                kx = ax / s_
+                K = torch.tensor([[0, -kx[2], kx[1]], [kx[2], 0, -kx[0]], [-kx[1], kx[0], 0]], device=c.device)
+                Rot = torch.eye(3, device=c.device) + s_ * K + (1 - c_) * (K @ K)
+                st._rotation.data[gi] = matrix_to_quaternion((Rot @ Rm[i])[None])[0]
+            st._xyz.data[gi] = c[i] + 0.5 * (tmin + tmax) * un
+            newS = S[i].clone()
+            newS[amax[i]] = 0.5 * (tmax - tmin) / 1.5
+            minor = sorted([a_ for a_ in range(3) if a_ != int(amax[i])], key=lambda a_: float(S[i, a_]))
+            w = h[i] / (h[i] + h[j])
+            for rank, a_ in enumerate(minor):                      # length-weighted thickness
+                newS[a_] = w * S[i, a_] + (1 - w) * Ssort[j, rank]
+            st._scaling.data[gi] = st.scaling_inverse_activation(newS)
+            st._features_dc.data[gi] = w * st._features_dc.data[gi] + (1 - w) * st._features_dc.data[gj]
+            st._opacity.data[gi] = torch.maximum(st._opacity.data[gi], st._opacity.data[gj])
+            drop.append(gj)
+        if not drop:
+            return 0
+        m = torch.zeros(st.get_xyz.shape[0], dtype=torch.bool, device=c.device)
+        m[torch.tensor(drop, device=c.device)] = True
+        st.prune_points(m)
+        return len(drop)
+
+    @torch.no_grad()
+    def merge_leaf_strprs(self, cos_thr=0.95, overlap=0.5, plane_frac=0.2, k=4):
+        """Merge leaf disks that are near-coplanar duplicates: parallel normals, the neighbour's
+        centre close to the plane, and centres closer than overlap x the smaller in-plane radius.
+        The larger disk is kept and grown to cover both; the smaller is deleted. Returns #merged."""
+        st = self.strprs
+        p = self.label_activation(st.label).squeeze(-1)
+        lidx = torch.nonzero(p <= 0.5).squeeze(1)
+        if lidx.numel() < 2:
+            return 0
+        c = st.get_xyz[lidx]; S = st.get_scaling[lidx]; Rm = build_rotation(st.get_rotation[lidx])
+        ar = torch.arange(lidx.numel(), device=c.device)
+        amin = S.argmin(dim=1)
+        n = Rm[ar, :, amin]
+        rad = S.max(dim=1).values
+        kk = min(k + 1, lidx.numel())
+        nbr = torch.cdist(c, c).topk(kk, largest=False).indices[:, 1:]
+        I = ar[:, None].expand_as(nbr).reshape(-1); J = nbr.reshape(-1)
+        keep = I < J
+        I, J = I[keep], J[keep]
+        d = c[J] - c[I]
+        cosang = (n[I] * n[J]).sum(-1).abs()
+        off = (d * n[I]).sum(-1).abs()
+        dist = d.norm(dim=-1)
+        rmin = torch.minimum(rad[I], rad[J])
+        ok = (cosang > cos_thr) & (off < plane_frac * rmin) & (dist < overlap * rmin)
+        if not ok.any():
+            return 0
+        I, J, dist = I[ok], J[ok], dist[ok]
+        used = torch.zeros(lidx.numel(), dtype=torch.bool, device=c.device)
+        drop = []
+        for o in torch.argsort(dist).tolist():
+            i, j = int(I[o]), int(J[o])
+            if used[i] or used[j]:
+                continue
+            used[i] = used[j] = True
+            if rad[j] > rad[i]:
+                i, j = j, i
+            gi, gj = int(lidx[i]), int(lidx[j])
+            wi = rad[i] ** 2 / (rad[i] ** 2 + rad[j] ** 2)
+            st._xyz.data[gi] = wi * c[i] + (1 - wi) * c[j]
+            newS = S[i].clone()
+            for a_ in range(3):
+                if a_ != int(amin[i]):
+                    newS[a_] = S[i, a_] + 0.5 * dist[o] / 3.0        # grow in-plane to span both
+            st._scaling.data[gi] = st.scaling_inverse_activation(newS)
+            st._features_dc.data[gi] = wi * st._features_dc.data[gi] + (1 - wi) * st._features_dc.data[gj]
+            drop.append(gj)
+        m = torch.zeros(st.get_xyz.shape[0], dtype=torch.bool, device=c.device)
+        m[torch.tensor(drop, device=c.device)] = True
+        st.prune_points(m)
+        return len(drop)
+
+    @torch.no_grad()
+    def prune_appgas_outside_masks(self, cameras, vote=0.5, dilate=7, min_views=3):
+        """Multi-view silhouette vote on the AppGS: project every AppGS centre into the training
+        views; delete the ones that land inside the (dilated) plant mask in fewer than `vote` of
+        the views that see them. Removes floaters that the photometric loss cannot reach and that
+        would otherwise be read out as branch points. Returns #deleted."""
+        from gaussian_renderer import _view_and_K
+        ag = self.appgas
+        X = ag.get_xyz
+        Xh = torch.cat([X, torch.ones_like(X[:, :1])], dim=1)
+        inside = torch.zeros(X.shape[0], device=X.device)
+        seen = torch.zeros(X.shape[0], device=X.device)
+        for cam in cameras:
+            if cam.mask is None:
+                continue
+            viewmat, K, W, H = _view_and_K(cam)
+            pc = (Xh @ viewmat[0].T)[:, :3]
+            z = pc[:, 2]
+            uv = (pc @ K[0].T)[:, :2] / z.clamp_min(1e-6)[:, None]
+            m = cam.mask.to(X.device).float()
+            if m.dim() == 3:
+                m = m[0]
+            if dilate > 1:
+                m = F.max_pool2d(m[None, None], dilate, stride=1, padding=dilate // 2)[0, 0]
+            Hm, Wm = m.shape
+            ui = (uv[:, 0] * Wm / W).long(); vi = (uv[:, 1] * Hm / H).long()
+            inf = (z > 0) & (ui >= 0) & (ui < Wm) & (vi >= 0) & (vi < Hm)
+            seen += inf.float()
+            val = torch.zeros_like(z)
+            val[inf] = m[vi[inf], ui[inf]]
+            inside += (val > 0.5).float()
+        frac = inside / seen.clamp_min(1)
+        bad = (seen >= min_views) & (frac < vote)
+        n = int(bad.sum())
+        if 0 < n < X.shape[0]:
+            ag.prune_points(bad)
+            self.nn_stpr_appgas = None
+        return n
+
+    @torch.no_grad()
+    def consolidate(self, cameras=None, min_bound=3, scale_frac=0.15, merge_branch=True,
+                    merge_leaf=True, mask_vote=0.5, **kw):
+        """One consolidation round: AppGS silhouette vote -> StrPr anomaly prune -> merges."""
+        out = {}
+        if cameras is not None and mask_vote > 0:
+            out["app_out"] = self.prune_appgas_outside_masks(cameras, vote=mask_vote)
+        out["str_anom"] = self.prune_strpr_anomalies(min_bound=min_bound, scale_frac=scale_frac)
+        if merge_branch:
+            out["br_merge"] = self.merge_branch_strprs(
+                cos_thr=kw.get("cos_thr", 0.95), gap_frac=kw.get("gap_frac", 0.25),
+                perp_frac=kw.get("perp_frac", 0.15))
+        if merge_leaf:
+            out["leaf_merge"] = self.merge_leaf_strprs(cos_thr=kw.get("cos_thr", 0.95))
+        self.nn_stpr_appgas = None
+        return out
+
+    def clamp_strpr_scale_to_bound(self, k=3.0, min_count=5):
+        """Keep each StrPr no larger than the AppGS bound to it: every scale axis is clamped to
+        k * (std of the bound AppGS along that axis). The binding distance only penalises AppGS
+        lying OUTSIDE a primitive, so nothing else stops a disk from growing past its leaf while
+        the StrPr render chases the AppGS render. StrPr with < min_count bound AppGS are left as is."""
+        st = self.strprs
+        if self.nn_stpr_appgas is None or self.nn_stpr_appgas.shape[0] != self.appgas.get_xyz.shape[0]:
+            self.update_nn_between_appgas_and_stprs()
+        nn = self.nn_stpr_appgas.squeeze(1)
+        K = st.get_xyz.shape[0]
+        Rm = build_rotation(st.get_rotation)                                  # (K,3,3)
+        local = torch.einsum('nij,ni->nj', Rm[nn], self.appgas.get_xyz - st.get_xyz[nn])   # (M,3)
+        cnt = torch.zeros(K, device=local.device).index_add_(0, nn, torch.ones_like(nn, dtype=torch.float))
+        sq = torch.zeros(K, 3, device=local.device).index_add_(0, nn, local ** 2)
+        std = torch.sqrt(sq / cnt.clamp_min(1)[:, None])
+        cap = (k * std).clamp_min(1e-5)
+        valid = (cnt >= min_count)[:, None]
+        new = torch.where(valid, torch.minimum(st.get_scaling, cap), st.get_scaling)
+        n_clamped = int((new < st.get_scaling - 1e-9).any(dim=1).sum())
+        st._scaling.data.copy_(self.scaling_inverse_activation(new))
+        return n_clamped
+
+    @torch.no_grad()
+    def sample_appgas_on_strprs(self, num_per_strpr=50, thickness=1e-4, cyl_halflen=3.0):
+        """Paper initialisation of AppGS: sample num_per_strpr flat Gaussians on the explicit
+        surface of every StrPr (cylinder side for branch StrPr, ellipse for leaf StrPr), z-axis
+        along the surface normal, scale diag(s, s, ~0), colour/semantics copied from the StrPr.
+        Surfaces use the same definition as the binding loss (build_primitive_surface)."""
+        st = self.strprs
+        K, n = st.get_xyz.shape[0], num_per_strpr
+        dev = st.get_xyz.device
+        branch = (st.label_activation(st.label) > 0.5).squeeze(1)
+        Rm = build_rotation(st.get_rotation)                       # (K,3,3), columns = local axes
+        S = st.get_scaling
+        C = st.get_xyz
+        ax0, ax1, ax2 = Rm[:, :, 0], Rm[:, :, 1], Rm[:, :, 2]
+
+        u1 = torch.rand(K, n, device=dev)
+        u2 = torch.rand(K, n, device=dev)
+        # cylinder side: axis ax0, half-length 3*s0, radius s2 (as in strpr_to_cylinder)
+        h, r = cyl_halflen * S[:, 0:1], S[:, 2:3]
+        t = (2 * u1 - 1) * h
+        th = 2 * math.pi * u2
+        radial = torch.cos(th)[..., None] * ax1[:, None] + torch.sin(th)[..., None] * ax2[:, None]
+        p_cyl = C[:, None] + t[..., None] * ax0[:, None] + r[..., None] * radial
+        n_cyl = radial
+        area_cyl = 2 * math.pi * r * 2 * h
+        # disk: semi-axes a = 2*s0 along ax0, b = s1 along ax1, normal ax2 (as in strpr_to_disk)
+        a, b = 2 * S[:, 0:1], S[:, 1:2]
+        rr = torch.sqrt(u1)
+        p_disk = C[:, None] + (a * rr * torch.cos(th))[..., None] * ax0[:, None] \
+            + (b * rr * torch.sin(th))[..., None] * ax1[:, None]
+        n_disk = ax2[:, None].expand(-1, n, -1)
+        area_disk = math.pi * a * b
+
+        bm = branch[:, None, None]
+        pos = torch.where(bm, p_cyl, p_disk).reshape(-1, 3)
+        nrm = F.normalize(torch.where(bm, n_cyl, n_disk).reshape(-1, 3), dim=-1)
+        area = torch.where(branch[:, None], area_cyl, area_disk)       # (K,1)
+        s = (torch.sqrt(area / n) * 0.5).clamp_min(1e-5).repeat_interleave(n, dim=0)  # (K*n,1)
+
+        # rotation whose z-axis is the surface normal
+        helper = torch.where((nrm[:, 0].abs() < 0.9)[:, None],
+                             torch.tensor([1., 0., 0.], device=dev).expand_as(nrm),
+                             torch.tensor([0., 1., 0.], device=dev).expand_as(nrm))
+        e1 = F.normalize(torch.cross(helper, nrm, dim=-1), dim=-1)
+        e2 = torch.cross(nrm, e1, dim=-1)
+        quat = matrix_to_quaternion(torch.stack([e1, e2, nrm], dim=-1))
+        scale = torch.cat([s, s, torch.full_like(s, thickness)], dim=1)
+
+        idx = torch.arange(K, device=dev).repeat_interleave(n)
+        ag = GaussianModel(sh_degree=self.max_sh_degree, device=self.device, save_path=self.save_path)
+        ag._xyz = nn.Parameter(pos.contiguous().requires_grad_(True))
+        ag._scaling = nn.Parameter(self.scaling_inverse_activation(scale).requires_grad_(True))
+        ag._rotation = nn.Parameter(quat.requires_grad_(True))
+        ag._features_dc = nn.Parameter(st._features_dc.detach()[idx].clone().requires_grad_(True))
+        ag._features_rest = nn.Parameter(st._features_rest.detach()[idx].clone().requires_grad_(True))
+        ag._opacity = nn.Parameter(self.inverse_opacity_activation(
+            0.5 * torch.ones((pos.shape[0], 1), device=dev)).requires_grad_(True))
+        ag.max_radii2D = torch.zeros(pos.shape[0], device=dev)
+        ag.label = nn.Parameter(st.label.detach()[idx].clone().requires_grad_(True))
+        ag._semantic_feature = nn.Parameter(st._semantic_feature.detach()[idx].clone().requires_grad_(True))
+        ag.active_sh_degree = st.active_sh_degree
+        ag.is_appgas = True
+        ag.text_feats = self.text_feats
+        self.appgas = ag
+        print(f"[GSplantModel] Sampled {pos.shape[0]} AppGS ({n} per StrPr, "
+              f"{int(branch.sum())} branch / {int((~branch).sum())} leaf StrPr).")
+        return ag
+
     def build_appgas_from_stprs(self,num_sample=10, use_pretrain=True, branch_mask=None):
         if use_pretrain:
             self.appgas = GaussianModel(sh_degree=self.max_sh_degree, device=self.device, save_path=self.save_path)
@@ -1597,6 +2074,47 @@ class GaussianModel:
             self.appgas.is_appgas = True
             self.appgas.text_feats = self.text_feats
         return self.appgas
+
+    @torch.no_grad()
+    def refined_branch_appgas_mask(self, k=8, cc_eps_frac=0.02, cc_min_frac=0.05):
+        """Export-time post-processing of the branch AppGS set (does not touch the model).
+
+        1) surface binding: each AppGS goes to the closest primitive SURFACE among its k nearest
+           StrPr centres -- branch StrPr as a finite cylinder (axis = largest scale, half-length
+           1.5x, radius = middle scale, as build_branch_graph), leaf StrPr as an ellipse (normal =
+           smallest scale, semi-axes 2x the larger scales). Nearest-centre binding lets a branch
+           StrPr at a leaf base swallow the leaf blade around it.
+        2) drop branch AppGS components (radius graph, cc_eps_frac x plant extent) holding less
+           than cc_min_frac of the branch points: detached leaf fragments.
+        Branch CD on newplant1-10 (full recipe, 7k): 77.1 -> 62.1."""
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        st = self.strprs
+        A = self.appgas.get_xyz
+        C, Sc = st.get_xyz, st.get_scaling
+        br = (self.label_activation(st.label).squeeze(1) > 0.5) & (Sc.max(dim=1).values > 0.001)
+        nb = knn_points(A[None], C[None], K=min(k, C.shape[0])).idx[0]                   # (N,k)
+        loc = torch.einsum('nkij,nki->nkj', build_rotation(st.get_rotation)[nb], A[:, None] - C[nb])
+        Sk, srt = Sc[nb], Sc[nb].sort(dim=-1).values
+        ax = loc.gather(-1, Sk.argmax(-1, keepdim=True)).squeeze(-1)
+        perp = ((loc ** 2).sum(-1) - ax ** 2).clamp_min(0).sqrt()
+        d_cyl = (perp - srt[..., 1]).abs() + (ax.abs() - 1.5 * srt[..., 2]).clamp_min(0)
+        nz = loc.gather(-1, Sk.argmin(-1, keepdim=True)).squeeze(-1)
+        inpl = ((loc ** 2).sum(-1) - nz ** 2).clamp_min(0).sqrt()
+        d_disk = nz.abs() + (inpl - 2 * srt[..., 2]).clamp_min(0)
+        isbr = br[nb]
+        best = torch.where(isbr, d_cyl, d_disk).argmin(dim=1, keepdim=True)
+        mask = isbr.gather(1, best).squeeze(1).cpu().numpy()
+        idx = np.where(mask)[0]
+        if len(idx) > 1:
+            Xn = A.detach().cpu().numpy().astype(np.float64)
+            ext = np.ptp(Xn, axis=0).max()
+            pairs = cKDTree(Xn[idx]).query_pairs(cc_eps_frac * ext, output_type="ndarray")
+            _, lab = connected_components(coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                                                     shape=(len(idx), len(idx))), directed=False)
+            cnt = np.bincount(lab)
+            mask[idx[cnt[lab] < cc_min_frac * len(idx)]] = False
+        return torch.as_tensor(mask, device=A.device)
 
     def update_nn_between_appgas_and_stprs(self, metric='euclidean'):
         app_xyz = self.appgas._xyz.detach()                     # (N_app, 3)

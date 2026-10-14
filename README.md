@@ -191,8 +191,80 @@ python train.py -s <scene> -m <scene>/feature_pretrain --speedup --iterations 30
 
 ### Step 2 — Structure extraction (this repo)
 
-Automatic pipeline: clean cloud → joint StrPr init → auto branch fraction → binding +
-axis alignment + graph + isolation pruning → branch-only densification.
+Paper schedule (`--paper`: K = N/100 StrPr, 500-it warmup, 50 AppGS sampled per StrPr,
+AppGS densification to 15k, radius filter + L_g after 15k, StrPr cap 4000) plus the
+automatic structural label init and the consolidation / loss fixes below. 7k iterations
+is enough — training past 15k degrades the branch geometry.
+
+```shell
+python train.py \
+  --source_path /mnt/data/gaussianplant_data/newplant9 \
+  --root_path   /mnt/data/gaussianplant_data \
+  --model_path  output/newplant9/run \
+  --clean_ply   pretrain_clean/newplant9_clean_pruned.ply \
+  --paper \
+  --label_init hybrid --traffic_alpha 0.03 --branch_frac -1 --label_lr 0 \
+  --clamp_scale 3 --bg_black --consolidate \
+  --iterations 7000 --disable_viewer
+```
+
+What the non-preset flags do:
+
+- **`--label_init hybrid`** — branch/leaf init of each StrPr, colour-free. *Path traffic*:
+  build a kNN graph on the plant points, take the shortest-path tree from the stem base
+  (lowest point along the mean camera up vector) and score each point by log(subtree size),
+  i.e. how much of the plant is reached through it. A StrPr is **branch** when its mean
+  score ≥ log(`traffic_alpha` × N) — at least 3 % of the plant lies downstream — so the
+  branch fraction adapts per scene. A weak shape term (`--hybrid_w_shape`, cluster linearity
+  − planarity − geodesic slice width) only flips borderline StrPr. `--label_init traffic`
+  is the same without the shape term.
+- **`--label_lr 0`** freezes the labels at their init (letting them drift degrades the skeleton).
+- **`--bg_black`** — photometric loss on the *full* render vs `gt × mask`. The masked loss
+  (`render × mask` vs `gt × mask`) gives no gradient outside the mask, so floaters grow there.
+- **`--consolidate`** — every 1000 it from 2000: delete AppGS that fall outside the plant mask
+  in most views, delete StrPr with < 3 bound AppGS or scale > 15 % of the plant extent (stops
+  unbound leaf disks from growing without limit), merge collinear duplicate branch cylinders
+  and coplanar overlapping leaf disks.
+- **`--clamp_scale 3`** — clamp each StrPr's scales to 3 σ of its bound AppGS.
+
+`--clean_ply` loads the background-removed cloud; StrPr are clustered from it and AppGS
+bound to them. (Alternatively, drop `--clean_ply` and pass `--load_iteration 30000 --rm_bg`
+to load the raw `feature_pretrain` and mask the background on the fly.)
+
+**Outputs** in `output/<scene>/run/point_cloud/iteration_7000/`:
+
+| file | content |
+|------|---------|
+| `strpr.ply` | all StrPr (full Gaussians; `label_0` > 0 ⇒ branch) |
+| `strpr_branch.ply` | branch StrPr only |
+| `branch.ply` | branch AppGS points, nearest-StrPr-centre binding |
+| `branch_refined.ply` | **branch AppGS after post-processing (use this as the prediction)** |
+| `appgas_branch.ply`, `appgas_branch_refined.ply` | the same two sets with full Gaussian attributes (renderable) |
+| `mst.ply` | branch MST skeleton |
+| `appgas.ply` | appearance Gaussians |
+| `point_cloud.ply` | StrPr + AppGS merged (any 3DGS viewer) |
+
+`branch_refined.ply` (export-time only, the model is untouched): every AppGS is re-bound to
+the closest primitive **surface** among its 8 nearest StrPr (branch = finite cylinder, leaf =
+ellipse) instead of the nearest centre — otherwise a branch StrPr at a leaf base swallows the
+blade around it — and branch components holding < 5 % of the branch points (radius graph at
+2 % of the plant extent) are dropped as detached leaf fragments.
+
+Mean branch Chamfer over newplant1–10 at 7k (mm, mean of both directions):
+
+| label init | `branch.ply` | `branch_refined.ply` |
+|------------|:-----------:|:-------------------:|
+| `joint` (old default, paper schedule) | 136.5 | – |
+| `traffic` + `--bg_black --consolidate` | 77.1 | 62.1 |
+| `hybrid` + `--bg_black --consolidate` | 67.7 | **56.9** |
+
+Single run per setting; `traffic_alpha`, `hybrid_w_shape` and the refinement thresholds are
+global constants chosen on these same 10 scenes. Remaining failure modes: leaf bases at
+petiole junctions, petioles running into leaf midribs (Monstera-type plants), fine twigs
+inside dense foliage (Ficus).
+
+<details>
+<summary>Legacy pipeline (joint colour/geometry/semantic init, before Oct 2026)</summary>
 
 ```shell
 python train.py \
@@ -208,21 +280,7 @@ python train.py \
   --densify_branch --branch_split_ratio 1.5 --max_strpr_num 4000 \
   --label_lr 0 --iterations 7000 --disable_viewer
 ```
-
-`--clean_ply` loads the background-removed cloud; StrPr are clustered from it and AppGS
-bound to them. (Alternatively, drop `--clean_ply` and pass `--load_iteration 30000 --rm_bg`
-to load the raw `feature_pretrain` and mask the background on the fly.)
-
-**Outputs** in `output/<scene>/run/point_cloud/iteration_7000/`:
-
-| file | content |
-|------|---------|
-| `strpr.ply` | all StrPr (full Gaussians) |
-| `strpr_branch.ply` | branch StrPr only |
-| `branch.ply` | bound branch AppGS points (Chamfer prediction) |
-| `mst.ply` | branch MST skeleton |
-| `appgas.ply` | appearance Gaussians |
-| `point_cloud.ply` | StrPr + AppGS merged (any 3DGS viewer) |
+</details>
 
 > [!WARNING]
 > **Do not add `--reg_overlap`.** The SuGaR-style overlap regulariser minimises neighbour
@@ -234,21 +292,20 @@ to load the raw `feature_pretrain` and mask the background on the fly.)
 
 ## Parameters to tune
 
-Most defaults generalise; these are the knobs to adjust per scene (point density and
-branch fraction vary by plant):
-
 | flag | default | what it controls / when to change |
 |------|:-------:|-----------------------------------|
-| `--branch_frac` | `-1` (auto) | Fraction of StrPr labelled **branch**. `-1` auto-calibrates via Otsu (capped 0.15). **The one knob that doesn't always auto-generalise:** when branches are a small mi[...]
-| `--cluster_size` | `40` | Avg points per StrPr cluster → StrPr **count / granularity**. Smaller = more, finer StrPr. |
-| `--prune_iso_factor` | `2.5` | Isolation pruning: demote a branch StrPr whose distance to its k-th nearest branch > `median × factor`. Lower → prune floaters harder. |
-| `--branch_split_ratio` | `1.5` | Branch densification: split a branch StrPr when its bound AppGS spill `> ratio × cylinder length`. Lower → finer skeleton. |
-| `--prune_green_z` | `0.8` | *(with `--prune_green`)* greenness z-score above which a floating StrPr is removed as a green leaf-float. |
-| `--lambda_axis` | `1.0` | Strength of the branch major-axis → branch-tangent alignment. |
-| `--densify_quantile` | `0.9` | *(only with generic `--densify`)* densify the top `(1-q)` fraction by gradient (gsplat grads are ~1e3× smaller, so a quantile not a fixed threshold). |
+| `--traffic_alpha` | `0.04` (use `0.03`) | Branch threshold of the traffic / hybrid init: a StrPr is branch if ≥ `alpha` of the plant is downstream of it. Lower → more branch. Results are flat for 0.025–0.04. |
+| `--hybrid_w_shape` | `0.25` | Weight of the shape term in `--label_init hybrid`. Higher helps strap-leaf plants, hurts plants whose branches are already well separated. |
+| `--consol_min_bound` / `--consol_scale_frac` | `3` / `0.15` | Consolidation: delete StrPr with fewer bound AppGS / larger scale (fraction of plant extent). |
+| `--consol_from` / `--consol_interval` | `2000` / `1000` | When consolidation runs. |
+| `--clamp_scale` | `0` (use `3`) | Clamp StrPr scales to k σ of their bound AppGS (0 = off). |
+| `--iterations` | `30000` with `--paper` | Use `7000`; the branch geometry degrades after 15k. |
+
+Any `--paper` preset value can be overridden by passing the flag explicitly, or with
+`--override key=value`.
 
 **Recommended defaults**
-- `--label_lr 0` **freezes** the branch/leaf labels at their joint-init values (init AUC ≈ 0.97; letting them drift degrades the skeleton).
+- `--label_lr 0` **freezes** the branch/leaf labels at their init values (letting them drift degrades the skeleton).
 - Prefer `--densify_branch` (binding-driven, branch-only) over generic `--densify` (which follows photometric gradient and densifies **leaves**, not branches).
 
 ---
@@ -257,8 +314,8 @@ branch fraction vary by plant):
 
 `semantic_classify.py` is a small **standalone** helper that labels a *cleaned* cloud
 branch/leaf purely from the **DINOv3 text similarity** of each point's 128-d feature —
-**no colour, no geometry**. It exists for the case where the colour cue in the joint init
-fails (e.g. **yellow / autumn leaves**, or branch and leaf colours that are hard to tell
+**no colour, no geometry**. It predates the structural (`hybrid`/`traffic`) init and exists for the case where the
+colour cue in the legacy joint init fails (e.g. **yellow / autumn leaves**, or branch and leaf colours that are hard to tell
 apart).
 
 ```shell
@@ -275,21 +332,27 @@ convention is undocumented, so try a few `--branch_idx/--leaf_idx`).
 > This is a **niche fallback, not the default path.** The pure text-similarity signal is
 > soft (per-point AUC ≈ 0.6–0.85, scene/prompt dependent). Use it **only on structurally
 > simple plants with almost no self-occlusion** — occlusion makes the per-point feature
-> unreliable. For normal scenes the joint init (colour + geometry + semantic) is far more
-> accurate; if only colour is the problem, prefer fixing the colour cue over this.
+> unreliable. For normal scenes use `--label_init hybrid` (colour-free, structural), which is far
+> more accurate.
 
 ---
 
 ## Evaluation
 
-Primary metric: Chamfer distance between the recovered branch points and the GT dense
-branch cloud `point_cloud_branch_dense.ply`.
+Primary metric: Chamfer distance between the predicted branch points
+(`branch_refined.ply`, or `branch.ply`) and the GT branch cloud
+`feature_pretrain/point_cloud/iteration_30000/point_cloud_branch.ply`.
 
 ```shell
 python eval_chamfer.py \
-  --gt /mnt/data/gaussianplant_data/newplant9/feature_pretrain/point_cloud/iteration_30000/point_cloud_branch_dense.ply \
+  --gt /mnt/data/gaussianplant_data/newplant9/feature_pretrain/point_cloud/iteration_30000/point_cloud_branch.ply \
   --scan output/newplant9          # ranks every run, prints the best
 ```
+
+> [!NOTE]
+> `eval_chamfer.py` prints `CD(L2)` as the **sum** of the two directions. The paper's
+> Table II (and the numbers above) use the **mean**: `(pred→gt + gt→pred) / 2`, in mm
+> (×1000), i.e. `CD(L2) / 2 × 1000`.
 
 ---
 

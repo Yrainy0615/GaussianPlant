@@ -99,6 +99,7 @@ class OptimizationParams(ParamGroup):
         self.exposure_lr_delay_mult = 0.0
         self.lambda_dssim = 0.2
         self.lambda_op = 0.05
+        self.lambda_cls = 0.1     # paper L_cls weight (used with --paper_losses)
         self.lambda_size = 0.5    # penalise oversized StrPr (within the overlap term)
         self.lambda_graph = 10
         self.lambda_bind = 0.1

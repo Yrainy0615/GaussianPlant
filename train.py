@@ -18,6 +18,7 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim, laplacian_smooth_loss, loss_endpoints, label_loss
+from utils.pytorch3d_compat import knn_points
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -46,13 +47,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         plant_mask = gaussians_pretrain.compute_plant_mask(scene.getTrainCameras())
         gaussians_pretrain.apply_mask(plant_mask)
 
+    # world up = mean camera "image up" direction (-y of each camera), used to find the stem base
+    with torch.no_grad():
+        up = -torch.stack([c.world_view_transform[:3, 1] for c in scene.getTrainCameras()]).mean(0)
+        up = (up / up.norm()).cpu().numpy()
     strpr = gaussians_pretrain.build_strpr_from_gs(
         cluster_method="kmeans", vis_cluster=False, max_strpr_num=args.max_strpr_num,
-        label_init=args.label_init, branch_frac=args.branch_frac, cluster_size=args.cluster_size)
+        label_init=args.label_init, branch_frac=args.branch_frac, cluster_size=args.cluster_size,
+        up=up, w_traffic=args.w_traffic, traffic_alpha=args.traffic_alpha, w_shape=args.hybrid_w_shape)
+    if args.move_xyz:   # positions are optimised (paper); 0 keeps them fixed
+        strpr.spatial_lr_scale = scene.cameras_extent
     strpr.training_setup(opt)
 
-    appgas = gaussians_pretrain.build_appgas_from_stprs(use_pretrain=True)
-    appgas.training_setup(opt)
+    # AppGS: either the cleaned Step-1 Gaussians (default), or -- as in the paper -- sampled
+    # on the StrPr surfaces after a StrPr-only warm-up of --warmup_iters iterations.
+    appgas = None
+    if args.appgas_init == "pretrain":
+        appgas = gaussians_pretrain.build_appgas_from_stprs(use_pretrain=True)
+        if args.move_xyz:
+            appgas.spatial_lr_scale = scene.cameras_extent
+        appgas.training_setup(opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -67,7 +81,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 
     for iteration in range(1, opt.iterations + 1):
         iter_start.record()
+        if appgas is None and iteration > args.warmup_iters:
+            appgas = gaussians_pretrain.sample_appgas_on_strprs(args.appgas_per_strpr,
+                                                                cyl_halflen=args.cyl_sample_halflen)
+            if args.move_xyz:
+                appgas.spatial_lr_scale = scene.cameras_extent
+            appgas.training_setup(opt)
+        warmup = appgas is None
         strpr.update_learning_rate(iteration)
+        if appgas is not None and args.move_xyz:
+            appgas.update_learning_rate(iteration)
         if iteration % 1000 == 0:
             strpr.oneupSHdegree()
 
@@ -85,16 +108,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         visibility_filter = render_pkg_strpr["visibility_filter"]
         radii = render_pkg_strpr["radii"]
 
-        render_pkg_appgas, _, _ = render_gsplant(viewpoint_cam, appgas, pipe, background)
-        render_appgas = render_pkg_appgas["render"]
-        feature_map = render_pkg_appgas["feature_map"]
-        radii_app = render_pkg_appgas["radii"]
-        viewspace_point_tensor_app = render_pkg_appgas["viewspace_points"]
-        visibility_filter_app = render_pkg_appgas["visibility_filter"]
+        if not warmup:
+            render_pkg_appgas, _, _ = render_gsplant(viewpoint_cam, appgas, pipe, background)
+            render_appgas = render_pkg_appgas["render"]
+            feature_map = render_pkg_appgas["feature_map"]
+            radii_app = render_pkg_appgas["radii"]
+            viewspace_point_tensor_app = render_pkg_appgas["viewspace_points"]
+            visibility_filter_app = render_pkg_appgas["visibility_filter"]
+        else:
+            render_appgas, feature_map = render_strpr, feature_map_strpr
 
         # Ground truth for this view
         gt_image = viewpoint_cam.original_image.cuda()
         mask = viewpoint_cam.mask.cuda() if viewpoint_cam.mask is not None else 1.0
+        # --bg_black: the target outside the plant mask is black and the RENDER is not masked, so
+        # anything drawn outside the plant is penalised. Masking both sides (the original code)
+        # leaves outside-mask pixels gradient-free, and densified Gaussians grow into large
+        # floaters/needles around the plant.
+        rmask = 1.0 if args.bg_black else mask
         gt_feature_map = viewpoint_cam.semantic_feature.cuda() if viewpoint_cam.semantic_feature is not None else None
 
         # --- Photometric: StrPr should track AppGS, AppGS should track the image ---
@@ -103,21 +134,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         # plant pixels the sparse StrPr leaves uncovered (black holes) the L1 dragged AppGS toward
         # black to match StrPr -> AppGS rendered ~4.5x too dark with holes, fighting its own GT term.
         # Also mask the term so only the plant region is matched (background is black in both).
-        Ll1 = l1_loss(render_strpr * mask, render_appgas.detach() * mask)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + \
-            opt.lambda_dssim * (1.0 - ssim(render_strpr * mask, gt_image * mask))
+        if warmup:
+            # StrPr-only warm-up (paper): L_p of the StrPr render against the image
+            Ll1 = l1_loss(render_strpr * rmask, gt_image * mask)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + \
+                opt.lambda_dssim * (1.0 - ssim(render_strpr * rmask, gt_image * mask))
+        else:
+            Ll1 = l1_loss(render_strpr * rmask, render_appgas.detach() * rmask)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + \
+                opt.lambda_dssim * (1.0 - ssim(render_strpr * rmask, gt_image * mask))
 
-        Ll1_appgas = l1_loss(render_appgas * mask, gt_image * mask)
-        loss += (1.0 - opt.lambda_dssim) * Ll1_appgas + \
-            opt.lambda_dssim * (1.0 - ssim(render_appgas * mask, gt_image * mask))
+            Ll1_appgas = l1_loss(render_appgas * rmask, gt_image * mask)
+            loss += (1.0 - opt.lambda_dssim) * Ll1_appgas + \
+                opt.lambda_dssim * (1.0 - ssim(render_appgas * rmask, gt_image * mask))
 
         # --- Semantic feature supervision (DINOv3) ---
         Ll1_feature = 0.0
-        if args.reg_sem and gt_feature_map is not None and feature_map is not None:
+        if args.reg_sem and not warmup and gt_feature_map is not None and feature_map is not None:
             gt_feature_map = F.interpolate(
                 gt_feature_map.unsqueeze(0), size=(feature_map.shape[1], feature_map.shape[2]),
                 mode='bilinear', align_corners=True).squeeze(0)
-            feat_loss = l1_loss(feature_map * mask, gt_feature_map * mask)
+            # == l1_loss(feature_map * mask, gt_feature_map * mask) for mask >= 0, two fewer (C,H,W) temporaries
+            feat_loss = ((feature_map - gt_feature_map).abs_() * mask).mean()
             loss += feat_loss
             Ll1_feature = feat_loss.item()
 
@@ -135,10 +173,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         # compute_for_appgas=False keeps AppGS geometry fixed (the cleaned plant points are
         # already good); binding only moves the StrPr cylinders/disks to fit them and refines
         # the branch/leaf label, instead of dragging AppGS off the skeleton.
-        if args.reg_bind and iteration > args.densify_from_iter:
+        if args.reg_bind and not warmup and iteration > args.densify_from_iter:
             bind_loss, dis_cylinder, dis_disk = gaussians_pretrain.compute_binding_loss(
                 compute_for_appgas=args.bind_move_appgas, prior='geo',
-                detach_label=not args.bind_label)
+                detach_label=not args.bind_label, normalize=not args.paper_losses,
+                appgas_grad_scale=args.bind_appgas_scale, paper_disk=args.paper_losses)
             reg_semantic = gaussians_pretrain.semantic_loss()
         else:
             bind_loss = torch.tensor(0.0, device=args.device)
@@ -152,10 +191,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         # pipeline; loss_op is kept as a constant 0 only so the tensorboard logging signature is
         # unchanged. (compute_gaussian_overlap_with_neighbors stays in the model, just unused.)
         loss_op = torch.tensor(0.0, device="cuda")
+        if args.paper_losses and not warmup and opt.lambda_op > 0:
+            # paper L_op (SuGaR-style neighbour overlap), now on activated scales
+            with torch.no_grad():
+                knn_idx = knn_points(strpr._xyz[None], strpr._xyz[None], K=8).idx[0]
+            loss_op = strpr.compute_gaussian_overlap_with_neighbors(knn_idx).mean()
+            loss += opt.lambda_op * loss_op
 
         # --- Graph (tree continuity / smoothness over the branch MST) ---
         loss_graph = torch.tensor(0.0, device="cuda")
-        if args.reg_graph and iteration > args.graph_from and iteration % args.graph_interval == 0:
+        if args.reg_graph and not warmup and iteration > args.graph_from and iteration % args.graph_interval == 0:
             mst_edges, points, _ = gaussians_pretrain.build_branch_graph()
             if points.shape[0] > 0:
                 loss_graph = laplacian_smooth_loss(points, mst_edges) + \
@@ -167,7 +212,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         # combined with the absolute colour cue (brown=branch). A branch-fraction prior keeps the
         # minority branch class alive. This replaces the cylinder/disk *distance* difference (which
         # collapsed: a wide disk captures everything -> all leaf) and the symmetric p(1-p) loss.
-        if args.reg_cls:
+        if args.paper_losses and not warmup and opt.lambda_cls > 0:
+            # paper L_cls = L_col + beta * L_conf on the StrPr labels
+            loss_cls = strpr.compute_color_contrast_loss(viewpoint_cam) + \
+                opt.lambda_conf * label_loss(strpr.label).mean()
+            loss += opt.lambda_cls * loss_cls
+        elif args.reg_cls:
             s_shape, valid = gaussians_pretrain.compute_shape_prior()          # [-1,1], high->branch
             rgb = 0.2820948 * strpr._features_dc.squeeze(1) + 0.5
             greenness = rgb[:, 1] - 0.5 * (rgb[:, 0] + rgb[:, 2])
@@ -185,7 +235,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 
         # --- Branch axis alignment: orient each branch StrPr's long axis ALONG the branch ---
         loss_axis = torch.tensor(0.0, device="cuda")
-        if args.reg_axis and iteration > args.densify_from_iter:
+        if args.reg_axis and not warmup and iteration > args.densify_from_iter:
             loss_axis = gaussians_pretrain.compute_branch_axis_alignment()
 
         total_loss = (loss + opt.lambda_bind * bind_loss
@@ -204,21 +254,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss,
-                            iter_start.elapsed_time(iter_end), testing_iterations, scene,
-                            render, (pipe, background), dataset.train_test_exp,
-                            render_strpr, feature_map, render_appgas, gt_feature_map,
-                            feature_map_strpr, render_branch_strpr,
-                            dis_cylinder, dis_disk, loss_op, loss_graph,
-                            Ll1_feature, 0.0, reg_semantic.item())
+            if not warmup:
+                training_report(tb_writer, iteration, Ll1, loss, l1_loss,
+                              iter_start.elapsed_time(iter_end), testing_iterations, scene,
+                              render, (pipe, background), dataset.train_test_exp,
+                              render_strpr, feature_map, render_appgas, gt_feature_map,
+                              feature_map_strpr, render_branch_strpr,
+                              dis_cylinder, dis_disk, loss_op, loss_graph,
+                              Ll1_feature, 0.0, reg_semantic.item())
 
-            if iteration in saving_iterations:
+            if iteration in saving_iterations and not warmup:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification. AppGS are the cleaned plant points and stay fixed by default
             # (--densify_appgas to enable); only StrPr densify, capped at max_strpr_num.
-            if iteration < opt.densify_until_iter:
+            if iteration < opt.densify_until_iter and not warmup:
                 strpr.max_radii2D[visibility_filter] = torch.max(
                     strpr.max_radii2D[visibility_filter], radii[visibility_filter])
                 strpr.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -242,14 +293,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                     else:
                         strpr.densify_and_prune(opt.densify_grad_threshold, 0.01,
                                                 scene.cameras_extent, size_threshold, radii, only_prune=True)
-                    if args.densify_appgas:
-                        appgas.densify_and_prune(opt.densify_grad_threshold, 0.005,
-                                                 scene.cameras_extent, 20, None, radii_app)
+                if args.densify_appgas and iteration > opt.densify_from_iter and \
+                        iteration % opt.densification_interval == 0:
+                    # standard 3DGS densification of AppGS (paper). gsplat means2d gradients are in
+                    # pixels, the original rasteriser's in NDC: rescale the 3DGS threshold by W/2.
+                    thr_a = opt.densify_grad_threshold / (0.5 * max(viewpoint_cam.image_width,
+                                                                    viewpoint_cam.image_height))
+                    appgas.densify_and_prune(thr_a, 0.005, scene.cameras_extent, 400, radii_app)
+
+            # Paper: when densification stops, filter misclassified branch StrPr by the radius-growth
+            # check along the branch MST (L_g is enabled from the same iteration via --graph_from).
+            if args.filter_radius_ratio > 0 and not warmup and iteration == opt.densify_until_iter:
+                nf = gaussians_pretrain.filter_branches_radius(ratio=args.filter_radius_ratio)
+                print(f"\n[ITER {iteration}] radius-growth filter: {nf} branch StrPr -> leaf")
 
             # Periodic structural pruning: demote floating/isolated false-branch StrPrs to leaf
             # (branches form a connected tree; mis-classified leaves float). The strongest lever
             # for the branch Chamfer (removes the false branches that dominate pred->gt error).
-            if args.prune_isolated and args.prune_from <= iteration <= args.prune_until \
+            if not warmup and args.prune_isolated and args.prune_from <= iteration <= args.prune_until \
                     and iteration % args.prune_interval == 0:
                 nd = gaussians_pretrain.prune_isolated_branches(
                     iso_factor=args.prune_iso_factor,
@@ -265,7 +326,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             # plant that the 2D mask cannot exclude). Geometry-based, so it complements the
             # photometric/opacity prunes. NOT capped at prune_until (unlike the branch-structure
             # prunes): the blobs regrow whenever left unpruned, so this runs through to the end.
-            if args.prune_large_scale and iteration >= args.prune_from \
+            if not warmup and args.prune_large_scale and iteration >= args.prune_from \
                     and iteration <= opt.iterations - 100 \
                     and iteration % args.prune_interval == 0:
                 nb = gaussians_pretrain.prune_large_scale(
@@ -275,10 +336,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                     print(f"\n[ITER {iteration}] pruned {nb} oversized StrPr "
                           f"(> {args.prune_scale_frac:.0%} scene extent), now {strpr.get_xyz.shape[0]}")
 
+            # Periodic structure consolidation (heuristic, between optimisation phases): silhouette
+            # vote on AppGS, delete orphan / oversized StrPr, merge duplicate branch cylinders and
+            # coplanar leaf disks. See GaussianModel.consolidate.
+            if not warmup and args.consolidate and args.consol_from <= iteration <= opt.iterations - 100 \
+                    and iteration % args.consol_interval == 0:
+                co = gaussians_pretrain.consolidate(
+                    cameras=scene.getTrainCameras(), min_bound=args.consol_min_bound,
+                    scale_frac=args.consol_scale_frac, merge_branch=args.consol_merge_branch,
+                    merge_leaf=args.consol_merge_leaf, mask_vote=args.consol_mask_vote)
+                appgas = gaussians_pretrain.appgas
+                print(f"\n[ITER {iteration}] consolidate {co} -> {strpr.get_xyz.shape[0]} StrPr, "
+                      f"{appgas.get_xyz.shape[0]} AppGS")
+
             # Structure-driven BRANCH densification: split branch StrPr that under-cover the AppGS
             # they bind (along-axis spill), filling long branch segments with more cylinders. Uses
             # binding geometry, not photometric gradient, so it densifies the skeleton (not leaves).
-            if args.densify_branch and args.prune_from <= iteration <= args.prune_until \
+            if not warmup and args.densify_branch and args.prune_from <= iteration <= args.prune_until \
                     and iteration % args.prune_interval == 0:
                 ns = gaussians_pretrain.densify_branches(
                     ratio_thr=args.branch_split_ratio, max_strpr_num=args.max_strpr_num)
@@ -290,8 +364,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             if iteration < opt.iterations:
                 strpr.optimizer.step()
                 strpr.optimizer.zero_grad(set_to_none=True)
-                appgas.optimizer.step()
-                appgas.optimizer.zero_grad(set_to_none=True)
+                if appgas is not None:
+                    appgas.optimizer.step()
+                    appgas.optimizer.zero_grad(set_to_none=True)
+                if args.clamp_scale > 0 and not warmup and iteration % 10 == 0:
+                    gaussians_pretrain.clamp_strpr_scale_to_bound(k=args.clamp_scale)
 
             if iteration == checkpoint_iterations:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -428,7 +505,14 @@ if __name__ == "__main__":
                              "pretrain_clean/newplant1_clean_pruned.ply (relative to --root_path)")
     parser.add_argument("--max_strpr_num", type=int, default=400)
     parser.add_argument("--label_init", type=str, default="joint",
-                        help='StrPr branch/leaf init: "joint" | "anisotropy" | "semantic"')
+                        help='StrPr branch/leaf init: "joint" | "traffic" | "joint_traffic" | "hybrid" | "anisotropy" | "semantic"')
+    parser.add_argument("--traffic_alpha", type=float, default=0.04,
+                        help="label_init=traffic with branch_frac<=0: StrPr is branch if its points carry "
+                             ">= alpha of the plant downstream (geodesic shortest-path tree from the base)")
+    parser.add_argument("--hybrid_w_shape", type=float, default=0.25,
+                        help="label_init=hybrid: weight of the shape cue (linear - planar - slice width) vs traffic")
+    parser.add_argument("--w_traffic", type=float, default=2.0,
+                        help="weight of the geodesic path-traffic cue in label_init=joint_traffic")
     parser.add_argument("--branch_frac", type=float, default=-1.0,
                         help="fraction of StrPr initialised as branch; <=0 auto-calibrates (Otsu, capped)")
     parser.add_argument("--cluster_size", type=int, default=100,
@@ -449,8 +533,75 @@ if __name__ == "__main__":
     parser.add_argument("--prune_interval", type=int, default=500)
     parser.add_argument("--prune_from", type=int, default=1000)
     parser.add_argument("--prune_until", type=int, default=3000)
+    # --- options that follow the paper (supp. Implementation Details); see --paper ---
+    parser.add_argument("--appgas_init", type=str, default="pretrain", choices=["pretrain", "sample"],
+                        help="AppGS = cleaned Step-1 Gaussians (pretrain) or sampled on StrPr surfaces (paper)")
+    parser.add_argument("--appgas_per_strpr", type=int, default=50)
+    parser.add_argument("--cyl_sample_halflen", type=float, default=3.0,
+                        help="AppGS are sampled on the cylinder side within +-k*s0 along the axis")
+    parser.add_argument("--warmup_iters", type=int, default=0,
+                        help="StrPr-only warm-up before AppGS are spawned (paper: 500; needs --appgas_init sample)")
+    parser.add_argument("--move_xyz", action="store_true", default=False,
+                        help="optimise StrPr/AppGS positions (paper); off keeps them fixed (xyz lr = 0)")
+    parser.add_argument("--paper_losses", action="store_true", default=False,
+                        help="paper losses: un-normalised L_bind with Eq.(9) disk distance, L_op, "
+                             "L_cls = L_col + beta*L_conf, L_sem")
+    parser.add_argument("--bind_appgas_scale", type=float, default=1.0,
+                        help="scale of the binding gradient reaching AppGS (paper: 0.1 vs 1 for StrPr)")
+    parser.add_argument("--consolidate", action="store_true", default=False,
+                        help="periodic heuristic StrPr consolidation (prune anomalies, merge duplicates)")
+    parser.add_argument("--consol_from", type=int, default=2000)
+    parser.add_argument("--consol_interval", type=int, default=1000)
+    parser.add_argument("--consol_min_bound", type=int, default=3,
+                        help="delete StrPr with fewer bound AppGS than this")
+    parser.add_argument("--consol_scale_frac", type=float, default=0.15,
+                        help="delete StrPr whose max scale exceeds this fraction of the plant extent")
+    parser.add_argument("--consol_mask_vote", type=float, default=0.5,
+                        help="delete AppGS inside the dilated plant mask in < this fraction of views (0=off)")
+    parser.add_argument("--consol_merge_branch", type=int, default=1)
+    parser.add_argument("--consol_merge_leaf", type=int, default=1)
+    parser.add_argument("--bg_black", action="store_true", default=False,
+                        help="photometric loss compares the UNMASKED render with the masked (black-"
+                             "background) image, so floaters outside the plant are penalised")
+    parser.add_argument("--clamp_scale", type=float, default=0.0,
+                        help="clamp every StrPr scale axis to k * std of its bound AppGS (0 = off); "
+                             "stops leaf disks from growing past their leaf")
+    parser.add_argument("--filter_radius_ratio", type=float, default=0.0,
+                        help="at densify_until_iter relabel branch StrPr whose radius > ratio x parent's "
+                             "on the branch MST as leaf (paper filtering; 0 = off)")
+    parser.add_argument("--no_bind_label", action="store_true", default=False,
+                        help="patch for --paper: the binding loss does not move the branch/leaf label "
+                             "(it inflates branches: a cylinder fits any blob better than a disk)")
+    parser.add_argument("--override", nargs="*", default=[],
+                        help="key=value pairs applied after the preset (switch individual items off)")
+    parser.add_argument("--paper", action="store_true", default=False,
+                        help="preset that reproduces the schedule and weights of the paper")
     args = parser.parse_args(sys.argv[1:])
+    if args.paper:
+        # Paper schedule (supp. Implementation Details). Flags given explicitly on the command
+        # line take precedence over the preset.
+        preset = dict(
+            cluster_size=100, label_init="anisotropy", appgas_init="sample", appgas_per_strpr=50,
+            warmup_iters=500, move_xyz=True, paper_losses=True,
+            reg_bind=True, bind_move_appgas=True, bind_label=True, bind_appgas_scale=0.1, lambda_bind=1.0,
+            reg_sem=True, lambda_sem=0.2, lambda_op=0.05, lambda_cls=0.1, label_lr=0.001,
+            densify_appgas=True, densify_branch=True, densify_until_iter=15000,
+            prune_from=500, prune_until=15000, prune_isolated=False, prune_large_scale=False,
+            reg_axis=False, reg_cls=False,
+            reg_graph=True, graph_from=15000, lambda_graph=1.0, iterations=30000,
+            filter_radius_ratio=2.0, max_strpr_num=4000)
+        given = {a.split("=")[0].lstrip("-") for a in sys.argv[1:] if a.startswith("--")}
+        for k, v in preset.items():
+            if k not in given:
+                setattr(args, k, v)
+    if args.no_bind_label:
+        args.bind_label = False
+    for kv in args.override:   # e.g. --override densify_appgas=False move_xyz=False
+        k, v = kv.split("=", 1)
+        cur = getattr(args, k)
+        setattr(args, k, (v.lower() in ("1", "true", "yes")) if isinstance(cur, bool) else type(cur)(v))
     args.save_iterations.append(args.iterations)
+    args.save_iterations = [i for i in args.save_iterations if i > args.warmup_iters]
 
     print("Optimizing " + args.model_path)
     safe_state(args.quiet)

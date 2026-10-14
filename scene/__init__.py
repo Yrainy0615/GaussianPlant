@@ -164,6 +164,13 @@ class Scene:
                 appgas_branch_mask = (branch_mask & scale_mask)[self.gaussians.nn_stpr_appgas.squeeze(1)]
                 self.gaussians.appgas.save_branch_ply(
                     os.path.join(point_cloud_path, "appgas_branch.ply"), appgas_branch_mask)
+                # post-processed branch set (surface binding + small-fragment removal)
+                ref = self.gaussians.refined_branch_appgas_mask()
+                self.gaussians.appgas.save_branch_ply(
+                    os.path.join(point_cloud_path, "appgas_branch_refined.ply"), ref)
+                ref_pd = o3d.geometry.PointCloud()
+                ref_pd.points = o3d.utility.Vector3dVector(self.gaussians.appgas.get_xyz[ref].detach().cpu().numpy())
+                o3d.io.write_point_cloud(os.path.join(point_cloud_path, "branch_refined.ply"), ref_pd)
         if self.gaussians.appgas is not None and not os.path.exists(os.path.join(point_cloud_path, "appgas.ply")):
             self.gaussians.appgas.save_ply(os.path.join(point_cloud_path, "appgas.ply"))
 

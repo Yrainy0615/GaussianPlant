@@ -248,7 +248,7 @@ def gs_to_cylinder_distance(xyz, nn, cylinder_params):
         d_side[cap_mask] = d_cap
     return d_side
 
-def gs_to_disk_distance(xyz, parent, disk_param):
+def gs_to_disk_distance(xyz, parent, disk_param, paper=False):
     C = disk_param['center'][parent]
     n = disk_param['n'][parent]
     a = disk_param['a'][parent]
@@ -256,6 +256,14 @@ def gs_to_disk_distance(xyz, parent, disk_param):
     xyz = xyz.to(C.device)  # Ensure xyz is on the same device as C
     v = xyz - C
     d_plane = torch.abs(torch.sum(v * n, dim=-1))
+    if paper:
+        # Paper Eq. (9): in-plane coordinates in the disk's own axes (u along a, v along b),
+        # rho = sqrt((x/a)^2 + (y/b)^2), nearest boundary point along the ray = [x/rho, y/rho].
+        x_coord = torch.sum(v * disk_param['u'][parent], dim=-1)
+        y_coord = torch.sum(v * disk_param['v'][parent], dim=-1)
+        rho = torch.sqrt((x_coord / (a + 1e-6))**2 + (y_coord / (b + 1e-6))**2).clamp_min(1e-6)
+        d_edge = torch.sqrt((x_coord - x_coord / rho)**2 + (y_coord - y_coord / rho)**2 + 1e-12)
+        return torch.where(rho <= 1.0, d_plane, torch.sqrt(d_plane**2 + d_edge**2))
 
     tmp = torch.tensor([1.,0.,0.], device=xyz.device).expand_as(n)
     e1 = F.normalize(torch.cross(n, tmp), dim=-1)
